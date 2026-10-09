@@ -2,9 +2,11 @@
 
 pub mod backend;
 pub mod fingerprint;
+pub mod replay;
 pub mod stub;
 pub mod types;
 
+pub use replay::{REPLAY_MODEL, ReplayDecisionBackend};
 pub use stub::{STUB_MODEL, StubDecisionBackend};
 
 pub use backend::{DecisionBackend, DecisionError};
