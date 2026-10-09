@@ -47,7 +47,7 @@ fn round6(x: f64) -> f64 {
     (x * 1e6).round() / 1e6
 }
 
-fn feature<'a>(state: &'a serde_json::Value, name: &str) -> Result<f64, DecisionError> {
+fn feature(state: &serde_json::Value, name: &str) -> Result<f64, DecisionError> {
     state
         .get("features")
         .and_then(|f| f.get(name))
