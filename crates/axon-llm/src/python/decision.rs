@@ -18,6 +18,12 @@ use crate::decision::http::{SdmHttpBackend, SdmHttpConfig};
 use crate::decision::replay::ReplayDecisionBackend;
 use crate::decision::stub::StubDecisionBackend;
 use crate::decision::types::{DecisionRequest, DecisionSource};
+use tokio::sync::Mutex as TokioMutex;
+
+use crate::backend::LLMBackend;
+use crate::backends::OpenAICompatBackend;
+use crate::decision::llm_fallback::parse_llm_content;
+use crate::types::Message;
 
 use super::helpers::pythonize;
 
@@ -62,6 +68,45 @@ impl PyCascadeConfig {
                 hold_threshold,
             },
         }
+    }
+}
+
+/// 把 Python 侧 LLMBackend 适配为决策兜底（仅绑定层耦合具体 OpenAICompatBackend）
+struct PyLlmFallbackAdapter {
+    llm: Arc<TokioMutex<OpenAICompatBackend>>,
+}
+
+#[async_trait::async_trait]
+impl FallbackDecider for PyLlmFallbackAdapter {
+    async fn decide(
+        &self,
+        state: &serde_json::Value,
+    ) -> Result<
+        (
+            crate::decision::types::Action,
+            std::collections::BTreeMap<String, f64>,
+            f64,
+        ),
+        DecisionError,
+    > {
+        let prompt = crate::decision::LlmFallback::default_template();
+        let state_str = state.to_string();
+        let vars = std::collections::HashMap::from([("state", state_str.as_str())]);
+        let user = prompt.render_user(&vars);
+        let messages = vec![
+            Message::system(prompt.system_with_few_shot()),
+            Message::user(user),
+        ];
+        let guard = self.llm.lock().await;
+        let resp = guard
+            .complete(&messages)
+            .await
+            .map_err(crate::decision::llm_fallback::map_llm_error)?;
+        drop(guard);
+        let content = resp
+            .content
+            .ok_or_else(|| DecisionError::Parse("llm empty".into()))?;
+        parse_llm_content(&content)
     }
 }
 
@@ -195,6 +240,28 @@ impl PyCascadeLayer {
         let layer = SdmCascadeDecisionLayer::new(
             backend.inner.clone(),
             Arc::new(RuleFallback::new()) as Arc<dyn FallbackDecider>,
+            config.inner,
+        );
+        Self {
+            shared: Arc::new(layer),
+            runtime: backend.runtime.clone(),
+        }
+    }
+
+    /// 用 LLM 兜底构造级联层
+    #[staticmethod]
+    #[pyo3(signature = (backend, llm_backend, config))]
+    fn with_llm_fallback(
+        backend: &PyDecisionBackend,
+        llm_backend: &crate::python::backend::PyLLMBackend,
+        config: &PyCascadeConfig,
+    ) -> Self {
+        let adapter = PyLlmFallbackAdapter {
+            llm: llm_backend.inner.clone(),
+        };
+        let layer = SdmCascadeDecisionLayer::new(
+            backend.inner.clone(),
+            Arc::new(adapter) as Arc<dyn FallbackDecider>,
             config.inner,
         );
         Self {
