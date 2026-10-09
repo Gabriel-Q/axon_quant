@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 请求指纹单一真源：`canonical_request` + sha256，保证录制回放跨语言一致
   - feature 门控：`decision`（核心，零网络依赖）/ `decision-http`（真实 HTTP 客户端）
   - PyO3 绑定暴露为 `axon_quant.llm.decision`，支持 `decide`（同步）/ `decide_async`（异步）
+  - Python 友好包装层 `axon_quant.decision`：`make_decision_backend` / `SdmCascadeDecisionLayer` / `CascadeConfig` / `RuleFallback` / `DecisionBackend`，封装原生 `_native.llm.decision` 绑定
 
 ## [0.14.2] - 2026-09-09
 
