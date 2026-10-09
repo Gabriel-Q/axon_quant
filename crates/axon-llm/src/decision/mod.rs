@@ -2,7 +2,10 @@
 
 pub mod backend;
 pub mod fingerprint;
+pub mod stub;
 pub mod types;
+
+pub use stub::{STUB_MODEL, StubDecisionBackend};
 
 pub use backend::{DecisionBackend, DecisionError};
 pub use types::{
