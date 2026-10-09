@@ -12,6 +12,8 @@ pub mod backend;
 pub mod backends;
 pub mod config;
 pub mod context;
+#[cfg(feature = "decision")]
+pub mod decision;
 pub mod declarative_agent;
 pub mod meter;
 pub mod prompt;

@@ -15,7 +15,7 @@ default = []
 # PyO3 绑定(默认禁用,启用需 python toolchain)。
 # 注意:python 隐含依赖 backends,因为 OpenAICompatBackend 是 LLMBackend 的唯一实现。
 # pyo3-async-runtimes 提供 tokio future → Python awaitable 桥接(chat_async / stream_chat_async)。
-python = ["dep:pyo3", "dep:pyo3-async-runtimes", "backends", "trading-backtest"]
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "backends", "trading-backtest", "decision-http"]
 # 启用 axon-explain 集成(异步记录 + 工具查询)
 explain = ["dep:axon-explain"]
 # 启用真实 LLM backend(DeepSeek / OpenAI / 本地推理服务)
@@ -33,6 +33,10 @@ backends = [
     "tokio/macros",
     "tokio/time",
 ]
+# SDM 结构化决策核心（类型/trait/stub/replay/cascade），仅需指纹用的 sha2/hex，零网络依赖
+decision = ["dep:sha2", "dep:hex"]
+# SDM 真实 HTTP 后端，复用 backends 的重试基建
+decision-http = ["decision", "backends"]
 # e2e 测试支持(wiremock mock HTTP)
 e2e = ["backends", "dep:wiremock"]
 # demo bin(deepseek 真实调用 + 真实工具) + ensemble 集成(多 backend 投票)
