@@ -1,5 +1,9 @@
 //! SDM 决策后端抽象与统一错误类型
 
+use async_trait::async_trait;
+
+use super::types::{DecisionRequest, DecisionResponse};
+
 /// SDM 决策调用的统一错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionError {
@@ -73,4 +77,14 @@ mod tests {
             "RateLimited"
         );
     }
+}
+
+/// SDM 决策后端 trait：所有实现（stub / replay / http）必须满足
+#[async_trait]
+pub trait DecisionBackend: Send + Sync {
+    /// 提交一次结构化决策请求
+    async fn decide(&self, req: &DecisionRequest) -> Result<DecisionResponse, DecisionError>;
+
+    /// 返回该后端的模型标识（stub 为 `sdm-stub`，http 为配置的 model）
+    fn model_name(&self) -> &str;
 }
