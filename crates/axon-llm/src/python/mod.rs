@@ -36,6 +36,9 @@ pub mod trajectory;
 
 pub mod swarm;
 
+#[cfg(feature = "decision-http")]
+pub mod decision;
+
 mod helpers;
 use helpers::{pythonize, type_name};
 
@@ -185,5 +188,11 @@ pub fn axon_llm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let swarm_submodule = PyModule::new(m.py(), "swarm")?;
     swarm::register_swarm_module(&swarm_submodule)?;
     m.add_submodule(&swarm_submodule)?;
+    #[cfg(feature = "decision-http")]
+    {
+        let decision_submodule = PyModule::new(m.py(), "decision")?;
+        decision::register_decision_module(&decision_submodule)?;
+        m.add_submodule(&decision_submodule)?;
+    }
     Ok(())
 }
