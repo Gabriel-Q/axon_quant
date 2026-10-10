@@ -6,6 +6,19 @@ All notable changes to AXON will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-10-09
+
+### Added
+
+- `axon-llm` 新增 SDM（Structured Decision Model，结构化决策模型）决策层，与 `LLMBackend` 并列的模型后端能力
+  - 新增 `decision` 模块：`DecisionBackend` trait + `DecisionRequest/Response`、三种 `Question/Answer`（noul/choice/score）、统一出口 `CascadeDecision`
+  - 三个后端实现：`StubDecisionBackend`（确定性模拟）、`ReplayDecisionBackend`（请求指纹精确回放）、`SdmHttpBackend`（真实 HTTP，复用 retry/recording/cost 基建）
+  - 置信门控级联 `SdmCascadeDecisionLayer`：高置信 SDM 直出、低置信/异常走兜底；`FallbackDecider` 协议 + `RuleFallback` + `LlmFallback`（包装 `LLMBackend`，打通 SDM→LLM 升级闭环）
+  - 请求指纹单一真源：`canonical_request` + sha256，保证录制回放跨语言一致
+  - feature 门控：`decision`（核心，零网络依赖）/ `decision-http`（真实 HTTP 客户端）
+  - PyO3 绑定暴露为 `axon_quant.llm.decision`，支持 `decide`（同步）/ `decide_async`（异步）
+  - Python 友好包装层 `axon_quant.decision`：`make_decision_backend` / `SdmCascadeDecisionLayer` / `CascadeConfig` / `RuleFallback` / `DecisionBackend`，封装原生 `_native.llm.decision` 绑定
+
 ## [0.14.5] - 2026-09-15
 
 ### Fixed

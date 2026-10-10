@@ -12,6 +12,8 @@ pub mod backend;
 pub mod backends;
 pub mod config;
 pub mod context;
+#[cfg(feature = "decision")]
+pub mod decision;
 pub mod declarative_agent;
 pub mod meter;
 pub mod prompt;
@@ -44,3 +46,12 @@ pub use trading::{
     TimeInForce, TradingBackend, TradingError, TradingMetrics,
 };
 pub use types::{FinishReason, LLMResponse, Message, Role, TokenUsage, ToolCall};
+
+#[cfg(feature = "decision")]
+pub use decision::{
+    CascadeConfig, DecisionBackend, DecisionError, DecisionRequest, DecisionResponse,
+    FallbackDecider, LlmFallback, ReplayDecisionBackend, RuleFallback, SdmCascadeDecisionLayer,
+    StubDecisionBackend,
+};
+#[cfg(all(feature = "decision", feature = "decision-http"))]
+pub use decision::{SdmHttpBackend, SdmHttpConfig};

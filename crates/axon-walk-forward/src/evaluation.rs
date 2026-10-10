@@ -92,7 +92,7 @@ pub fn compute_deflated_sharpe(observed_sharpe: f64, n_trials: usize, sharpe_std
     }
 
     // 期望最大 Sharpe（在无技能零假设下）
-    let euler_gamma = 0.5772156649015329;
+    let euler_gamma = std::f64::consts::EULER_GAMMA;
     let log_n = (n_trials as f64).ln().max(1.0);
     let sqrt_2_log_n = (2.0 * log_n).sqrt();
     let e_max =
