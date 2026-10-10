@@ -20,6 +20,9 @@
 //!
 //! 运行:`cargo test -p axon-backtest --lib streaming::strategy::`
 
+use std::collections::HashMap;
+
+use axon_core::market::Bar;
 use axon_core::order::Order;
 use axon_core::types::Instrument;
 
@@ -63,6 +66,30 @@ pub trait StreamingStrategy: Send {
     /// `Vec<StrategyAction>`,按执行顺序排列(先返回的先执行)。
     /// 长度为 0 表示"本 tick 不做任何操作"(等价于一个 `Hold`)。
     fn on_tick(&mut self, instrument: &Instrument, price: f64) -> Vec<StrategyAction>;
+
+    /// 处理带特征的 K 线回调，返回应执行的动作列表
+    ///
+    /// 用于实盘因子注入：外部计算好的因子值通过 `features` 传入，策略可直接读取做决策。
+    ///
+    /// # 参数
+    ///
+    /// - `instrument`: K 线对应的交易品种
+    /// - `bar`: 当前 K 线（可能是未收盘的实时更新版，OHLC 随 tick 更新）
+    /// - `features`: 预计算的因子值（{因子名: 值}），由外部 FactorInjector 计算后注入
+    ///
+    /// # 返回
+    ///
+    /// `Vec<StrategyAction>`，与 `on_tick` 语义一致。
+    ///
+    /// 默认实现退化到 `on_tick`（用 `bar.close`），保证不破坏现有策略。
+    fn on_bar(
+        &mut self,
+        instrument: &Instrument,
+        bar: &Bar,
+        _features: &HashMap<String, f64>,
+    ) -> Vec<StrategyAction> {
+        self.on_tick(instrument, bar.close.as_f64())
+    }
 }
 
 /// SMA 均线交叉策略
@@ -151,7 +178,8 @@ impl StreamingStrategy for SmaCrossover {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axon_core::types::{SpotInstrument, Symbol};
+    use axon_core::market::Bar;
+    use axon_core::types::{Price, Quantity, SpotInstrument, Symbol};
 
     fn btc_spot() -> Instrument {
         Instrument::Spot(SpotInstrument {
@@ -204,5 +232,64 @@ mod tests {
             }
         }
         panic!("uptrend 序列应触发至少 1 次 Buy");
+    }
+
+    /// 验证 on_bar 默认退化到 on_tick
+    #[test]
+    fn on_bar_default_delegates_to_on_tick() {
+        let mut s = FixedStrategy::new(vec![StrategyAction::Hold]);
+        let inst = btc_spot();
+        let bar = Bar {
+            timestamp: axon_core::time::Timestamp::from_nanos(0),
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(105.0),
+            low: Price::from_f64(95.0),
+            close: Price::from_f64(102.0),
+            volume: Quantity::from_f64(0.0),
+        };
+        let features = HashMap::new();
+        // on_bar 默认调 on_tick(price = bar.close = 102.0)
+        let actions = s.on_bar(&inst, &bar, &features);
+        assert_eq!(actions, vec![StrategyAction::Hold]);
+    }
+
+    /// 验证自定义 on_bar 能收到 features
+    #[test]
+    fn on_bar_receives_features() {
+        struct FeatureAwareStrategy {
+            received_feature: f64,
+        }
+        impl StreamingStrategy for FeatureAwareStrategy {
+            fn on_tick(&mut self, _inst: &Instrument, _price: f64) -> Vec<StrategyAction> {
+                vec![]
+            }
+            fn on_bar(
+                &mut self,
+                _inst: &Instrument,
+                _bar: &Bar,
+                features: &HashMap<String, f64>,
+            ) -> Vec<StrategyAction> {
+                self.received_feature = features.get("RSI").copied().unwrap_or(0.0);
+                vec![]
+            }
+        }
+
+        let mut s = FeatureAwareStrategy {
+            received_feature: 0.0,
+        };
+        let inst = btc_spot();
+        let bar = Bar {
+            timestamp: axon_core::time::Timestamp::from_nanos(0),
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(105.0),
+            low: Price::from_f64(95.0),
+            close: Price::from_f64(102.0),
+            volume: Quantity::from_f64(0.0),
+        };
+        let mut features = HashMap::new();
+        features.insert("RSI".to_string(), 72.5);
+
+        s.on_bar(&inst, &bar, &features);
+        assert!((s.received_feature - 72.5).abs() < 1e-9);
     }
 }

@@ -6,6 +6,21 @@ All notable changes to AXON will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-10-10
+
+### Added
+
+- **实盘因子注入基础设施**（为 QuantCell 因子策略实盘化铺路）
+  - `ExchangeAdapter::fetch_ohlcv(symbol, interval, limit)`：Binance + Okx 适配器新增历史 K 线 REST 请求，返回 `Vec<Bar>`。启动时填充 `KlineBuffer`，避免实盘从零攒历史数据。
+  - `axon_core::KlineBuffer`：滚动 K 线缓冲，支持 `load_history` + `push_tick` + `bars()`，自动处理跨周期收盘。供实盘因子计算读取历史 OHLCV。
+  - `StreamingStrategy::on_bar(instrument, bar, features)`：带特征注入的策略回调，`features: HashMap<String, f64>` 由外部 FactorInjector 计算后注入。默认实现退化到 `on_tick`，向后兼容。
+  - `StreamingEngine::on_bar_with_features(instrument, bar, features)`：实盘因子注入入口，复用 `execute_actions` 撮合逻辑。
+  - PyO3 绑定：`axon_quant.backtest.KlineBuffer`、`BinanceAdapter.fetch_ohlcv`、`OkxAdapter.fetch_ohlcv`。
+
+### Changed
+
+- `StreamingEngine::on_market_event` 的 action 处理逻辑抽取为私有 `execute_actions`，供 `on_bar_with_features` 复用。
+
 ## [0.15.0] - 2026-10-09
 
 ### Added

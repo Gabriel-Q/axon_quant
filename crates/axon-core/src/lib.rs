@@ -64,8 +64,8 @@ pub use error::{Error, Result};
 
 // 市场数据核心类型 re-export（便于 `axon_core::Tick` 等短路径）
 pub use market::{
-    Bar, BarPeriod, MarketDataError, MarketDataResult, OrderBookLevel, OrderBookSnapshot, Side,
-    Tick, Trade,
+    Bar, BarPeriod, KlineBuffer, MarketDataError, MarketDataResult, OrderBookLevel,
+    OrderBookSnapshot, Side, Tick, Trade,
 };
 
 // 通用类型 re-export

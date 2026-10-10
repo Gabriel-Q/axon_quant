@@ -201,88 +201,7 @@ impl StreamingEngine {
                 };
 
                 // 3. 应用 actions,收集 fill events
-                let mut events = Vec::new();
-                for action in actions {
-                    match action {
-                        StrategyAction::Submit(mut order) => {
-                            // 3a. paper 模式:对限价单应用滑点
-                            if let Some(paper) = self.paper.as_ref()
-                                && let Some(limit_p) = order.order_type.limit_price()
-                            {
-                                let slip = paper.apply_slippage(limit_p.as_f64(), order.side);
-                                order.order_type = OrderType::Limit {
-                                    price: Price::from_f64(slip),
-                                };
-                            }
-                            // 3a-partial. paper 模式:partial fill 裁决(0.4.0)
-                            // 先取决策,避免与后续 engines 借用冲突
-                            let (should_fill, fill_ratio) = if let Some(paper) = self.paper.as_mut()
-                            {
-                                (paper.should_fill(), paper.fill_ratio())
-                            } else {
-                                // 非 paper 模式:永远 100% 整笔成交
-                                (true, 1.0_f64)
-                            };
-                            if !should_fill {
-                                // 拒单:跳过本笔 submit(模拟"未成交")
-                                continue;
-                            }
-                            // 按 fill_ratio 缩减 quantity
-                            if fill_ratio < 1.0 {
-                                let scaled = order.quantity.as_f64() * fill_ratio;
-                                order.quantity = Quantity::from_f64(scaled);
-                            }
-                            // 3b. 撮合(走 L1)
-                            if let Some(engine) = self.engines.get_mut(&instrument) {
-                                let result = engine.submit(order);
-                                for fill in result.fills {
-                                    self.total_trades += 1;
-                                    // 3c. 写 portfolio
-                                    let trade = Trade::new(
-                                        fill.timestamp,
-                                        fill.price,
-                                        fill.quantity,
-                                        fill.taker_order_id,
-                                        fill.maker_order_id,
-                                    );
-                                    // 0.4.0:记录 fill 前后 realized_pnl 差值(包含 realized - commission)
-                                    let pnl_before = self.portfolio.total_realized_pnl();
-                                    let _ = self.portfolio.apply_trade_instrument(
-                                        &instrument,
-                                        &trade,
-                                        fill.taker_side,
-                                        fill.timestamp,
-                                    );
-                                    let pnl_delta =
-                                        self.portfolio.total_realized_pnl() - pnl_before;
-                                    // 0.4.0:记录 metrics(equity_curve / max_dd / sharpe)
-                                    let current_nav = self.portfolio.nav() as f64 / 1_000_000.0;
-                                    // pnl_delta 已含 realized - commission,但 trading_metrics 单独
-                                    // 累加 fees 用于报告 → 拆 fee ≈ 0 简化(commission 已在 pnl_delta 中)
-                                    self.metrics.record_fill(
-                                        pnl_delta,
-                                        0, // fees 已计入 pnl_delta,避免重复扣
-                                        current_nav,
-                                        fill.timestamp,
-                                    );
-                                    // 3d. 推回 fill event
-                                    let seq = self.fill_seq.fetch_add(1, Ordering::Relaxed);
-                                    events.push(Event::Fill(FillEvent::new(
-                                        seq,
-                                        fill.timestamp,
-                                        trade,
-                                    )));
-                                }
-                            }
-                        }
-                        StrategyAction::Cancel(order_id) => {
-                            if let Some(engine) = self.engines.get_mut(&instrument) {
-                                let _ = engine.cancel(order_id);
-                            }
-                        }
-                        StrategyAction::Hold => {}
-                    }
-                }
+                let events = self.execute_actions(&instrument, actions);
 
                 // 抑制未使用变量警告(tick_qty / tick_ts / tick_side 暂未使用,留给后续扩展)
                 let _ = (tick_qty, tick_ts, tick_side);
@@ -292,6 +211,107 @@ impl StreamingEngine {
             MarketDataEvent::Heartbeat => vec![],
             MarketDataEvent::Disconnected => vec![],
         }
+    }
+
+    /// 处理带特征的 K 线事件（实盘因子注入入口）
+    ///
+    /// 与 `on_market_event` 的区别：
+    /// - 传入完整 `Bar`（OHLCV）而非单个 tick
+    /// - 传入预计算的 `features`（因子值），供策略的 `on_bar` 读取
+    /// - portfolio mark-to-market 用 `bar.close`
+    ///
+    /// 返回本 bar 产生的 `Event::Fill`（可能为空）。
+    pub fn on_bar_with_features(
+        &mut self,
+        instrument: &Instrument,
+        bar: &axon_core::market::Bar,
+        features: &HashMap<String, f64>,
+    ) -> Vec<Event> {
+        // 1. 更新 portfolio mark-to-market（用 bar.close）
+        self.portfolio
+            .update_market_price_instrument(instrument, bar.close);
+
+        // 2. 调 strategy.on_bar 拿 actions（无 strategy 则空）
+        let actions = match &mut self.strategy {
+            Some(s) => s.on_bar(instrument, bar, features),
+            None => Vec::new(),
+        };
+
+        // 3. 应用 actions
+        self.execute_actions(instrument, actions)
+    }
+
+    /// 执行策略 actions（撮合 + 记账 + 指标），返回 fill events
+    ///
+    /// 从 `on_market_event` 抽取，供 `on_bar_with_features` 复用。
+    fn execute_actions(
+        &mut self,
+        instrument: &Instrument,
+        actions: Vec<StrategyAction>,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        for action in actions {
+            match action {
+                StrategyAction::Submit(mut order) => {
+                    // paper 模式:对限价单应用滑点
+                    if let Some(paper) = self.paper.as_ref()
+                        && let Some(limit_p) = order.order_type.limit_price()
+                    {
+                        let slip = paper.apply_slippage(limit_p.as_f64(), order.side);
+                        order.order_type = OrderType::Limit {
+                            price: Price::from_f64(slip),
+                        };
+                    }
+                    // paper 模式:partial fill 裁决
+                    let (should_fill, fill_ratio) = if let Some(paper) = self.paper.as_mut() {
+                        (paper.should_fill(), paper.fill_ratio())
+                    } else {
+                        (true, 1.0_f64)
+                    };
+                    if !should_fill {
+                        continue;
+                    }
+                    if fill_ratio < 1.0 {
+                        let scaled = order.quantity.as_f64() * fill_ratio;
+                        order.quantity = Quantity::from_f64(scaled);
+                    }
+                    // 撮合(走 L1)
+                    if let Some(engine) = self.engines.get_mut(instrument) {
+                        let result = engine.submit(order);
+                        for fill in result.fills {
+                            self.total_trades += 1;
+                            let trade = Trade::new(
+                                fill.timestamp,
+                                fill.price,
+                                fill.quantity,
+                                fill.taker_order_id,
+                                fill.maker_order_id,
+                            );
+                            let pnl_before = self.portfolio.total_realized_pnl();
+                            let _ = self.portfolio.apply_trade_instrument(
+                                instrument,
+                                &trade,
+                                fill.taker_side,
+                                fill.timestamp,
+                            );
+                            let pnl_delta = self.portfolio.total_realized_pnl() - pnl_before;
+                            let current_nav = self.portfolio.nav() as f64 / 1_000_000.0;
+                            self.metrics
+                                .record_fill(pnl_delta, 0, current_nav, fill.timestamp);
+                            let seq = self.fill_seq.fetch_add(1, Ordering::Relaxed);
+                            events.push(Event::Fill(FillEvent::new(seq, fill.timestamp, trade)));
+                        }
+                    }
+                }
+                StrategyAction::Cancel(order_id) => {
+                    if let Some(engine) = self.engines.get_mut(instrument) {
+                        let _ = engine.cancel(order_id);
+                    }
+                }
+                StrategyAction::Hold => {}
+            }
+        }
+        events
     }
 
     /// 提交订单(给"无 strategy"用户路径用)

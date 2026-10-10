@@ -368,9 +368,42 @@ impl PyBinanceAdapter {
         Ok(d)
     }
 
+    /// 获取历史 K 线，返回 list[dict]，每个 dict 含 timestamp/open/high/low/close/volume。
+    fn fetch_ohlcv<'py>(
+        &self,
+        py: Python<'py>,
+        symbol: &str,
+        interval: &str,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let sym = RustSymbol::new(symbol);
+        let bars = self
+            .rt
+            .block_on(async move { self.inner.fetch_ohlcv(&sym, interval, limit).await })
+            .map_err(to_py_err)?;
+        let list = PyList::empty(py);
+        for bar in &bars {
+            list.append(bar_to_dict(py, bar)?)?;
+        }
+        Ok(list)
+    }
+
     fn __repr__(&self) -> String {
         "BinanceAdapter(...)".to_string()
     }
+}
+
+/// Bar → Python dict（timestamp 为毫秒，OHLCV 为 f64）
+fn bar_to_dict<'py>(py: Python<'py>, bar: &axon_core::Bar) -> PyResult<Bound<'py, PyDict>> {
+    use pyo3::types::PyDict;
+    let d = PyDict::new(py);
+    d.set_item("timestamp", bar.timestamp.nanos / 1_000_000)?;
+    d.set_item("open", bar.open.as_f64())?;
+    d.set_item("high", bar.high.as_f64())?;
+    d.set_item("low", bar.low.as_f64())?;
+    d.set_item("close", bar.close.as_f64())?;
+    d.set_item("volume", bar.volume.as_f64())?;
+    Ok(d)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

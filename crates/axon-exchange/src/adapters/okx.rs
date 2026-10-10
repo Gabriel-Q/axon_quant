@@ -15,6 +15,8 @@ use tokio::time::{Duration, interval};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use axon_core::{Bar, Price, Quantity, Timestamp};
+
 use crate::error::ExchangeError;
 use crate::sign;
 use crate::traits::ExchangeAdapter;
@@ -1072,6 +1074,52 @@ impl ExchangeAdapter for OkxAdapter {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
         })
+    }
+
+    async fn fetch_ohlcv(
+        &self,
+        symbol: &Symbol,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Bar>, ExchangeError> {
+        // OKX bar 参数大小写敏感：1m/5m/15m/30m/1H/2H/4H/6H/12H/1D/1W/1M
+        let okx_bar = match interval {
+            "1h" => "1H",
+            "2h" => "2H",
+            "4h" => "4H",
+            "6h" => "6H",
+            "12h" => "12H",
+            "1d" => "1D",
+            "1w" => "1W",
+            "1M" => "1M",
+            other => other, // 1m/3m/5m/15m/30m 等小写直接透传
+        };
+        let path = format!("/api/v5/market/candles?instId={symbol}&bar={okx_bar}&limit={limit}");
+        let json = self.send_okx_public(&path).await?;
+
+        let data = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| ExchangeError::ParseError("fetch_ohlcv: missing data array".into()))?;
+
+        // OKX candle: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+        let bars: Vec<Bar> = data
+            .iter()
+            .filter_map(|k| {
+                let ts_str = k.get(0)?.as_str()?;
+                let ts_ms: i64 = ts_str.parse().ok()?;
+                Some(Bar {
+                    timestamp: Timestamp::from_millis(ts_ms),
+                    open: Price::from_f64(k.get(1)?.as_str()?.parse().ok()?),
+                    high: Price::from_f64(k.get(2)?.as_str()?.parse().ok()?),
+                    low: Price::from_f64(k.get(3)?.as_str()?.parse().ok()?),
+                    close: Price::from_f64(k.get(4)?.as_str()?.parse().ok()?),
+                    volume: Quantity::from_f64(k.get(5)?.as_str()?.parse().ok()?),
+                })
+            })
+            .collect();
+
+        Ok(bars)
     }
 }
 
