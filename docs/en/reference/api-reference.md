@@ -492,6 +492,9 @@ print(f"Total balance: {account.total_balance}, Available: {account.available_ba
 # Query funding rate
 funding = await adapter.get_funding_rate("BTCUSDT")
 print(f"Funding rate: {funding.rate}, Next settlement: {funding.next_funding_ms}")
+
+# Fetch historical K-lines (new in 0.16.0, seeds KlineBuffer for live factor injection)
+history = adapter.fetch_ohlcv("BTCUSDT", "1h", 500)   # list[dict], timestamp in milliseconds
 ```
 
 ---

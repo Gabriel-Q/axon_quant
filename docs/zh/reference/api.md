@@ -32,6 +32,7 @@ cargo doc --workspace --no-deps --open
 
 - `Order` / `OrderId` / `OrderSide` / `OrderType` / `TimeInForce`
 - `MarketData` / `Tick` / `Bar` / `OrderBook`
+- `KlineBuffer`(0.16.0 新增,滚动 K 线缓冲)
 - `Event` / `EventQueue` / `SimulatedClock`
 - `Portfolio` / `Position` / `Cash`
 - `Scheduler` / `ImpactModel` / `LatencyModel` / `FeeModel`
@@ -55,3 +56,4 @@ cargo doc --workspace --no-deps --open
 - `trading::TradingBackend` trait
 - `trading::RiskLimits` / `SafetyMode` / `RiskGate`
 - `trading::TradingMetrics`
+- `decision::DecisionBackend` / `SdmCascadeDecisionLayer` / `CascadeConfig` / `RuleFallback`(0.15.0 新增,SDM 决策层)

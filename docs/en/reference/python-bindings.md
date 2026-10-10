@@ -63,6 +63,43 @@ agent = llm.ReActAgent(backend=backend, tools=[...])
 response = agent.chat([llm.LLMMessage.user("Analyze BTC market")])
 ```
 
+### axon_quant.decision (new in `0.15.0`) — SDM Structured Decision Layer
+
+Python wrapper for `axon-llm`'s SDM (Structured Decision Model) decision layer, wrapping the native `_native.llm.decision` bindings. A model-backend capability parallel to `LLMBackend`: high-confidence SDM decisions pass through directly, low-confidence/error cases fall back.
+
+| Class / Function | Description |
+|------------------|-------------|
+| `make_decision_backend(config)` | Factory: build a decision backend by `config["mode"]`. `"stub"` (deterministic simulation, no extra fields) / `"replay"` (requires `fixtures` JSONL path) / `"http"` (requires `base_url` / `api_key` / `model`, optional `timeout_secs` / `max_retries`) |
+| `DecisionBackend` | Decision backend wrapper (holds trait object + dedicated tokio runtime) |
+| `RuleFallback` | Rule-based fallback (no-arg constructor) |
+| `CascadeConfig` | Gating config: `open_threshold` (default 0.80) / `hold_threshold` (default 0.70) |
+| `SdmCascadeDecisionLayer` | Cascade decision layer: `decide(state, questions)` (sync) / `decide_async(state, questions)` (async); `with_llm_fallback(backend, llm_backend, config)` builds with LLM fallback |
+
+#### Example: SDM cascade decision (rule fallback)
+
+```python
+from axon_quant.decision import (
+    make_decision_backend, SdmCascadeDecisionLayer, CascadeConfig, RuleFallback,
+)
+
+# 1) Build backend (stub mode, zero network dependency)
+backend = make_decision_backend({"mode": "stub"})
+
+# 2) Cascade layer: high-confidence SDM passes through, low-confidence falls back to rules
+layer = SdmCascadeDecisionLayer(backend, RuleFallback(), CascadeConfig())
+
+# 3) Decide (state / questions are dicts)
+d = layer.decide(
+    {"symbol": "BTCUSDT", "price": 60000.0},
+    [{"kind": "choice", "name": "action", "options": ["buy", "hold", "sell"]}],
+)
+print(d["action"], d["source"], d["confidence"])
+# source: "sdm_direct" (SDM direct) / "fallback"
+# returned dict also has probabilities / fallback_reason / sdm_usage / sub_signals
+```
+
+> The real HTTP backend requires the `decision-http` feature; `with_llm_fallback` can escalate low-confidence decisions to an `LLMBackend` for review.
+
 ### axon_quant.hpo — Hyperparameter Optimization
 
 ```python
@@ -463,6 +500,7 @@ Backtest engine with L1/L2/L3 matching engines, market impact modeling, and even
 | `BacktestError` | Matching exception (inherits `Exception`, **not** `AxonError`, to avoid cargo cycle) |
 | `OrderBookEntry` | L2 order book entry (for `from_entries` import) |
 | `DarkOrder` / `CrossPair` / `AuctionResult` / `ArbitrageOpportunity` | L3 dark pool / cross-asset / auction / arbitrage data types |
+| `KlineBuffer` | Rolling K-line buffer (new in `0.16.0`): `load_history(bars)` / `push_tick(timestamp_ns, price)` / `bars()` / `len()` / `is_empty()`, auto-handles period rollover; feeds historical OHLCV to live factor computation |
 | `limit_order(id, instrument, side, price, quantity, tif="GTC")` | Factory returning a limit order dict (`0.5.0`: `instrument` dict replaces old `symbol` string) |
 | `market_order(id, instrument, side, quantity)` | Factory returning a market order dict (tif forced to IOC) |
 | `spot_instrument(base, quote)` | Factory returning a spot instrument dict (`{"kind": "spot", "base": ..., "quote": ...}`) |
@@ -511,6 +549,33 @@ print(result.events_processed, result.fills, result.final_nav)
 ```
 
 > 📖 **0.5.0 multi-leg backtest (spot + perp delta-neutral arbitrage)**: see [multi-leg-backtest.md](multi-leg-backtest.md).
+
+#### Example: KlineBuffer rolling K-line buffer (live factor injection)
+
+New in `0.16.0`. Seed historical K-lines at startup via `load_history` (from `adapter.fetch_ohlcv`),
+update the current bar in real time via `push_tick`, and read `bars()` for factor computation.
+
+```python
+from axon_quant.backtest import KlineBuffer
+
+# 1) Create (period + max length)
+buf = KlineBuffer("1h", 1000)
+
+# 2) Seed historical K-lines (timestamp in nanoseconds)
+buf.load_history([
+    {"timestamp": 1_700_000_000_000_000_000, "open": 60000.0, "high": 60100.0,
+     "low": 59900.0, "close": 60050.0, "volume": 100.0},
+    # ...
+])
+
+# 3) Real-time tick update (auto period rollover: same period updates high/low/close,
+#    new period closes the old bar into the queue)
+buf.push_tick(timestamp_ns=1_700_003_600_000_000_000, price=61000.0)
+
+# 4) Read (closed + current unclosed bars)
+bars = buf.bars()          # list[dict] with timestamp/open/high/low/close/volume
+print(buf.len(), buf.is_empty())
+```
 
 #### Submit Order Return Protocol
 
@@ -851,6 +916,8 @@ Real exchange adapters (Binance, OKX) with WebSocket subscription, rate limiting
 | `ExchangeError` | Exchange-specific error (inherits `Exception`, **not** `AxonError` to avoid cargo cycle) |
 | `binance_testnet_config()` | Factory: read Binance testnet API keys from environment variables |
 | `okx_testnet_config()` | Factory: read OKX testnet API keys from environment variables |
+| `BinanceAdapter.fetch_ohlcv(symbol, interval, limit)` | Fetch historical K-lines (new in `0.16.0`), returns `list[dict]` (timestamp in ms + OHLCV); used to seed `KlineBuffer` at startup |
+| `OkxAdapter.fetch_ohlcv(symbol, interval, limit)` | Same (OKX V5 `/api/v5/market/candles`) |
 
 #### Example: testnet connection (env keys)
 
@@ -882,6 +949,35 @@ adapter.cancel_order(oid)
 # 查询
 balances = adapter.get_balance()
 positions = adapter.get_positions()
+```
+
+#### Example: fetch historical K-lines to seed KlineBuffer (live factor injection)
+
+New in `0.16.0`. At live startup, fetch historical K-lines into `KlineBuffer` so factors don't have to accumulate data from scratch.
+
+```python
+from axon_quant.backtest import KlineBuffer
+from axon_quant.exchange import BinanceAdapter, binance_testnet_config
+
+adapter = BinanceAdapter(binance_testnet_config())
+adapter.connect()
+
+# 1) Fetch historical K-lines (timestamp in milliseconds)
+history = adapter.fetch_ohlcv("BTCUSDT", "1h", 500)
+
+# 2) Convert to nanoseconds and seed KlineBuffer
+buf = KlineBuffer("1h", 1000)
+buf.load_history([
+    {
+        "timestamp": int(b["timestamp"]) * 1_000_000,  # ms → ns
+        "open": b["open"], "high": b["high"], "low": b["low"],
+        "close": b["close"], "volume": b["volume"],
+    }
+    for b in history
+])
+
+# 3) Real-time tick update + factor computation (see factor injection flow)
+buf.push_tick(timestamp_ns=1_700_003_600_000_000_000, price=61000.0)
 ```
 
 #### Order dict protocol

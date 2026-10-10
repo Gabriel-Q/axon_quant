@@ -47,6 +47,7 @@ python -c "import axon_quant; print(axon_quant.__version__)"
 | `BacktestError` | 撮合异常(继承 `Exception`,**不**继承 `AxonError`,避免 cargo 循环) |
 | `OrderBookEntry` | L2 订单簿条目(用于 `from_entries` 导入) |
 | `DarkOrder` / `CrossPair` / `AuctionResult` / `ArbitrageOpportunity` | L3 暗池 / 跨资产 / 拍卖 / 套利数据结构 |
+| `KlineBuffer` | 滚动 K 线缓冲(`0.16.0` 新增):`load_history(bars)` / `push_tick(timestamp_ns, price)` / `bars()` / `len()` / `is_empty()`,自动处理跨周期收盘,供实盘因子计算读取历史 OHLCV |
 | `limit_order(id, instrument, side, price, quantity, tif="GTC")` | 工厂函数,返回限价单 dict(`0.5.0` 起 `instrument` dict 取代旧 `symbol` 字符串) |
 | `market_order(id, instrument, side, quantity)` | 工厂函数,返回市价单 dict(tif 强制 IOC) |
 | `spot_instrument(base, quote)` | 工厂函数,返回 spot instrument dict(`{"kind": "spot", "base": ..., "quote": ...}`) |
@@ -98,6 +99,32 @@ print(result.events_processed, result.fills, result.final_nav)
 > 0.5.0 引入 `Instrument` 抽象 + 多 leg API,
 > 0.6.0 收口全栈 Instrument 化 + 跨 leg 风险约束。
 > 见 [multi-leg-backtest.md](multi-leg-backtest.md)。
+
+#### 示例:KlineBuffer 滚动 K 线缓冲(实盘因子注入)
+
+`0.16.0` 新增。启动时用 `load_history` 灌入历史 K 线(来自 `adapter.fetch_ohlcv`),
+实时用 `push_tick` 更新当前 Bar,`bars()` 供因子计算读取。
+
+```python
+from axon_quant.backtest import KlineBuffer
+
+# 1) 创建(周期 + 最大长度)
+buf = KlineBuffer("1h", 1000)
+
+# 2) 灌入历史 K 线(timestamp 为纳秒)
+buf.load_history([
+    {"timestamp": 1_700_000_000_000_000_000, "open": 60000.0, "high": 60100.0,
+     "low": 59900.0, "close": 60050.0, "volume": 100.0},
+    # ...
+])
+
+# 3) 实时 tick 更新(自动处理跨周期收盘:同周期更新 high/low/close,跨周期收盘旧 Bar 入队)
+buf.push_tick(timestamp_ns=1_700_003_600_000_000_000, price=61000.0)
+
+# 4) 读取(已收盘 + 当前未收盘 Bar)
+bars = buf.bars()          # list[dict],每个含 timestamp/open/high/low/close/volume
+print(buf.len(), buf.is_empty())
+```
 
 #### 提交订单返回 dict 协议
 
@@ -482,6 +509,8 @@ except axon_quant.oms.OmsError as e:  # 实际是 Exception 子类
 | `ExchangeError` | 交易所异常(继承 `Exception`,**不**继承 `AxonError` 以避免 cargo 循环) |
 | `binance_testnet_config()` | 工厂:从环境变量读 Binance testnet API key |
 | `okx_testnet_config()` | 工厂:从环境变量读 OKX testnet API key |
+| `BinanceAdapter.fetch_ohlcv(symbol, interval, limit)` | 拉取历史 K 线(`0.16.0` 新增),返回 `list[dict]`(timestamp 毫秒 + OHLCV),用于启动时填充 `KlineBuffer` |
+| `OkxAdapter.fetch_ohlcv(symbol, interval, limit)` | 同上(OKX V5 `/api/v5/market/candles`) |
 
 #### 示例:testnet 连接(env 读 key)
 
@@ -513,6 +542,35 @@ adapter.cancel_order(oid)
 # 查询
 balances = adapter.get_balance()
 positions = adapter.get_positions()
+```
+
+#### 示例:拉取历史 K 线填充 KlineBuffer(实盘因子注入)
+
+`0.16.0` 新增。实盘启动时先拉历史 K 线灌入 `KlineBuffer`,避免因子从零攒数据。
+
+```python
+from axon_quant.backtest import KlineBuffer
+from axon_quant.exchange import BinanceAdapter, binance_testnet_config
+
+adapter = BinanceAdapter(binance_testnet_config())
+adapter.connect()
+
+# 1) 拉历史 K 线(timestamp 为毫秒)
+history = adapter.fetch_ohlcv("BTCUSDT", "1h", 500)
+
+# 2) 转纳秒后灌入 KlineBuffer
+buf = KlineBuffer("1h", 1000)
+buf.load_history([
+    {
+        "timestamp": int(b["timestamp"]) * 1_000_000,  # 毫秒 → 纳秒
+        "open": b["open"], "high": b["high"], "low": b["low"],
+        "close": b["close"], "volume": b["volume"],
+    }
+    for b in history
+])
+
+# 3) 实时 tick 更新 + 因子计算(见 factor 注入流程)
+buf.push_tick(timestamp_ns=1_700_003_600_000_000_000, price=61000.0)
 ```
 
 #### 订单 dict 协议
@@ -889,6 +947,43 @@ except ComplianceError as e:
 | `CancelOrderTool` | 撤单 tool |
 | `ReplaceOrderTool` | 改单 tool |
 | `TradingMetrics` | 指标收集器(支持 callback + snapshot) |
+
+### `axon_quant.decision`(`0.15.0` 新增)—— SDM 结构化决策层
+
+`axon-llm` 的 SDM(Structured Decision Model)决策层 Python 包装,封装原生 `_native.llm.decision` 绑定。与 `LLMBackend` 并列的模型后端能力:高置信 SDM 直出、低置信/异常走兜底。
+
+| 类 / 函数 | 说明 |
+|-----------|------|
+| `make_decision_backend(config)` | 工厂:按 `config["mode"]` 构造决策后端。`"stub"`(确定性模拟,无额外字段)/ `"replay"`(需 `fixtures` JSONL 路径)/ `"http"`(需 `base_url` / `api_key` / `model`,可选 `timeout_secs` / `max_retries`) |
+| `DecisionBackend` | 决策后端包装(持有 trait 对象 + 独占 tokio runtime) |
+| `RuleFallback` | 规则兜底(无参数构造) |
+| `CascadeConfig` | 门控配置:`open_threshold`(默认 0.80)/ `hold_threshold`(默认 0.70) |
+| `SdmCascadeDecisionLayer` | 级联决策层:`decide(state, questions)`(同步)/ `decide_async(state, questions)`(异步);`with_llm_fallback(backend, llm_backend, config)` 用 LLM 兜底构造 |
+
+#### 示例:SDM 级联决策(规则兜底)
+
+```python
+from axon_quant.decision import (
+    make_decision_backend, SdmCascadeDecisionLayer, CascadeConfig, RuleFallback,
+)
+
+# 1) 构造后端(stub 模式,零网络依赖)
+backend = make_decision_backend({"mode": "stub"})
+
+# 2) 级联层:高置信 SDM 直出,低置信走规则兜底
+layer = SdmCascadeDecisionLayer(backend, RuleFallback(), CascadeConfig())
+
+# 3) 决策(state / questions 为 dict)
+d = layer.decide(
+    {"symbol": "BTCUSDT", "price": 60000.0},
+    [{"kind": "choice", "name": "action", "options": ["buy", "hold", "sell"]}],
+)
+print(d["action"], d["source"], d["confidence"])
+# source: "sdm_direct"(SDM 直出) / "fallback"(兜底)
+# 返回 dict 还含 probabilities / fallback_reason / sdm_usage / sub_signals
+```
+
+> 真实 HTTP 后端需编译 `decision-http` feature;`with_llm_fallback` 可把低置信决策升级到 `LLMBackend` 复核。
 
 ## 示例:LLM 交易 Mock 端到端
 

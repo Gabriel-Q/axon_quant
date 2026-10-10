@@ -32,6 +32,7 @@ Output is in the `target/doc/` directory.
 
 - `Order` / `OrderId` / `OrderSide` / `OrderType` / `TimeInForce`
 - `MarketData` / `Tick` / `Bar` / `OrderBook`
+- `KlineBuffer` (new in 0.16.0, rolling K-line buffer)
 - `Event` / `EventQueue` / `SimulatedClock`
 - `Portfolio` / `Position` / `Cash`
 - `Scheduler` / `ImpactModel` / `LatencyModel` / `FeeModel`
@@ -55,6 +56,7 @@ Output is in the `target/doc/` directory.
 - `trading::TradingBackend` trait
 - `trading::RiskLimits` / `SafetyMode` / `RiskGate`
 - `trading::TradingMetrics`
+- `decision::DecisionBackend` / `SdmCascadeDecisionLayer` / `CascadeConfig` / `RuleFallback` (new in 0.15.0, SDM decision layer)
 
 ### axon-hpo
 

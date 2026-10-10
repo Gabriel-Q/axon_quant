@@ -4,8 +4,9 @@ AXON's complete changelog is maintained in the repository root's [`CHANGELOG.md`
 
 ## Current Version
 
-- **Latest stable:** [`v0.11.0`](https://github.com/pengwow/axon_quant/blob/main/CHANGELOG.md#0110---2026-08-01) — Multi-Agent voting consensus + LLM infrastructure wrap-up (E7-E12)
-- **Previous:** [`v0.10.0`](https://github.com/pengwow/axon_quant/blob/main/CHANGELOG.md#0100---2026-07-24) — LLM agent trading (ReAct + Mock/Ollama provider + 5 trading tools + trajectory recording)
+- **Latest stable:** [`v0.16.0`](https://github.com/pengwow/axon_quant/blob/main/CHANGELOG.md#0160---2026-10-10) — Live factor injection infrastructure (`fetch_ohlcv` + `KlineBuffer` + `on_bar` feature injection)
+- **Previous:** [`v0.15.0`](https://github.com/pengwow/axon_quant/blob/main/CHANGELOG.md#0150---2026-10-09) — SDM structured decision layer (`DecisionBackend` + confidence-gated cascade + LLM fallback)
+- **Earlier:** [`v0.11.0`](https://github.com/pengwow/axon_quant/blob/main/CHANGELOG.md#0110---2026-08-01) — Multi-Agent voting consensus + LLM infrastructure wrap-up (E7-E12)
 
 ## Versioning
 
