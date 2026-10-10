@@ -868,6 +868,14 @@ mod tests {
         ) -> Result<axon_exchange::LongShortRatio, ExchangeError> {
             unimplemented!("Task 9 不测试 long_short_ratio")
         }
+        async fn fetch_ohlcv(
+            &self,
+            _symbol: &ExSymbol,
+            _interval: &str,
+            _limit: usize,
+        ) -> Result<Vec<axon_core::Bar>, ExchangeError> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]
@@ -983,6 +991,14 @@ mod tests {
             _symbol: &str,
         ) -> Result<axon_exchange::LongShortRatio, ExchangeError> {
             unimplemented!()
+        }
+        async fn fetch_ohlcv(
+            &self,
+            _symbol: &ExSymbol,
+            _interval: &str,
+            _limit: usize,
+        ) -> Result<Vec<axon_core::Bar>, ExchangeError> {
+            Ok(Vec::new())
         }
     }
 

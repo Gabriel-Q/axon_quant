@@ -28,7 +28,7 @@ The **bottom-most** type library in the workspace; defines shared data structure
 - `crates/axon-core/src/lib.rs` — public re-exports
 - `crates/axon-core/src/time/` — `Timestamp` / `MonotonicClock` / `TimePrecision`
 - `crates/axon-core/src/types/` — `Price` / `Quantity` / `Symbol`
-- `crates/axon-core/src/market/` — `Tick` / `Bar` / `OrderBookSnapshot` / `Trade`
+- `crates/axon-core/src/market/` — `Tick` / `Bar` / `OrderBookSnapshot` / `Trade` / `KlineBuffer` (new in `0.16.0`, rolling K-line buffer)
 - `crates/axon-core/src/order/` — `Order` / `OrderType` / `TimeInForce` / `OrderStatus` state machine
 - `crates/axon-core/src/event/` — `Event` / `EventBuilder` / `EventRouter` / `EventHandler`
 - `crates/axon-core/src/queue/` — `EventQueue` (priority queue sorted by timestamp)
@@ -85,6 +85,20 @@ bt.push_event({
     "order": limit_order(1, spot_instrument("BTC", "USDT"), "Buy", 100.0, 1.0),  # 0.5.0+: instrument dict replaces "BTCUSDT" string
 })
 result = bt.run()
+```
+
+**`KlineBuffer` (new in `0.16.0`, for live factor injection):**
+
+```python
+from axon_quant.backtest import KlineBuffer
+
+buf = KlineBuffer("1h", 1000)                       # period + max length
+buf.load_history([{                                  # seed historical K-lines at startup (ns timestamps)
+    "timestamp": 1_700_000_000_000_000_000,
+    "open": 60000.0, "high": 60100.0, "low": 59900.0, "close": 60050.0, "volume": 100.0,
+}])
+buf.push_tick(timestamp_ns=1_700_003_600_000_000_000, price=61000.0)  # real-time update, auto period rollover
+bars = buf.bars()                                    # list[dict], read by factor computation
 ```
 
 **Rust side (use when developing a new crate / writing integration tests):**
@@ -814,8 +828,15 @@ LLM agents: ReAct reasoning loop + Tool Calling + context window + three built-i
   - `vote.rs` — voting strategies (`HardVote` / `SoftVote` / `WeightedVote`)
   - `paper_trading.rs` — paper trading backend
 - `crates/axon-llm/src/backends/` — LLM backends: `OpenAICompat` / `Mock` / `Recording` / `Retry` / `Cost` / `Streaming`
+- `crates/axon-llm/src/decision/` — SDM structured decision layer (new in `0.15.0`)
+  - `backend.rs` — `DecisionBackend` trait + `DecisionError`
+  - `types.rs` — `DecisionRequest` / `DecisionResponse` / `CascadeDecision` / three `Question` kinds (noul / choice / score)
+  - `stub.rs` / `replay.rs` / `http.rs` — three backend impls (deterministic simulation / request-fingerprint replay / real HTTP)
+  - `cascade.rs` — `SdmCascadeDecisionLayer` (confidence-gated cascade) + `FallbackDecider` / `RuleFallback`
+  - `llm_fallback.rs` — `LlmFallback` (wraps `LLMBackend`, closing the SDM→LLM escalation loop)
+  - `fingerprint.rs` — `canonical_request` + sha256 (cross-language-consistent record/replay)
 - `crates/axon-llm/src/explain/` — decision explanation bridge (integrates with `axon-explain`)
-- `crates/axon-llm/src/python/` — PyO3 bindings: `PyReActAgent` / `PyTrajectoryRecorder` / `PySwarmOrchestrator` / `PyBacktestTradingBackend`
+- `crates/axon-llm/src/python/` — PyO3 bindings: `PyReActAgent` / `PyTrajectoryRecorder` / `PySwarmOrchestrator` / `PyBacktestTradingBackend` / `decision` (SDM decision layer)
 
 ### Core Mechanism
 - **ReAct loop**: `ReActAgent::run(input)` loops: LLM returns Thought → Action → Observation → Thought again → … until `FinishReason`
@@ -825,6 +846,7 @@ LLM agents: ReAct reasoning loop + Tool Calling + context window + three built-i
 - **Recording & replay**: `backends/recording.rs` records request/response for e2e tests
 - **Trajectory recording**: `TrajectoryRecorder` captures every LLM step (thought/action/observation/reward) and writes JSON files with schema v0.11.0
 - **Token metering**: `TokenMeter` tracks token usage per agent, `TokenBudget` warns when exceeding thresholds; cost estimated via built-in `MODEL_PRICING` table
+- **SDM decision layer** (`0.15.0`): `DecisionBackend` sits alongside `LLMBackend`; `SdmCascadeDecisionLayer` does confidence gating — high-confidence SDM passes through, low-confidence/error cases go to a `FallbackDecider` (`RuleFallback` or `LlmFallback`); `canonical_request` + sha256 keeps record/replay cross-language consistent
 
 ### Applicable Scenarios
 - Use an LLM to interpret market state and place orders (`ReActAgent` + `PlaceOrderTool`)
@@ -891,6 +913,19 @@ orchestrator = SwarmOrchestrator(
 )
 decision = orchestrator.run({"symbol": "BTC-USDT", "market": bars[-100:]})
 print(decision.action, decision.confidence, decision.votes)
+
+# ─── Scenario 4: SDM structured decision layer (0.15.0, confidence gating + fallback) ─
+from axon_quant.decision import (
+    make_decision_backend, SdmCascadeDecisionLayer, CascadeConfig, RuleFallback,
+)
+
+backend = make_decision_backend({"mode": "stub"})          # stub / replay / http
+layer = SdmCascadeDecisionLayer(backend, RuleFallback(), CascadeConfig())
+d = layer.decide(
+    {"symbol": "BTC-USDT", "price": 60000.0},
+    [{"kind": "choice", "name": "action", "options": ["buy", "hold", "sell"]}],
+)
+print(d["action"], d["source"], d["confidence"])           # source: sdm_direct / fallback
 ```
 
 **Rust side (use when developing new Tools / new backends):**
@@ -1651,6 +1686,9 @@ adapter.replace_order(order_id, new_price="50100", new_quantity="0.1")
 # 4) Query order status / history
 status = adapter.get_order_status(order_id)
 open_orders = adapter.get_open_orders("BTCUSDT")
+
+# 4.5) Fetch historical K-lines (new in 0.16.0, seeds KlineBuffer for live factor injection)
+history = adapter.fetch_ohlcv("BTCUSDT", "1h", 500)   # list[dict], timestamp in milliseconds
 
 # 5) Local order lifecycle management (crash recovery)
 mgr = OrderLifecycleManager()

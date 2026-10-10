@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use axon_core::Bar;
+
 use crate::error::ExchangeError;
 use crate::types::{
     AccountBalance, AccountInfo, DepthSnapshot, ExchangeId, FundingRate, LeverageBracket,
@@ -57,4 +59,17 @@ pub trait ExchangeAdapter: Send + Sync {
 
     /// 获取多空账户比(主动买入/卖出成交量比,市场情绪指标)
     async fn get_long_short_ratio(&self, symbol: &str) -> Result<LongShortRatio, ExchangeError>;
+
+    /// 获取历史 K 线（实盘启动时填充 KlineBuffer）
+    ///
+    /// Args:
+    /// - `symbol`: 交易对
+    /// - `interval`: K 线周期字符串（"1m", "5m", "1h", "4h", "1d"）
+    /// - `limit`: 返回根数（交易所上限通常 1000）
+    async fn fetch_ohlcv(
+        &self,
+        symbol: &Symbol,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Bar>, ExchangeError>;
 }

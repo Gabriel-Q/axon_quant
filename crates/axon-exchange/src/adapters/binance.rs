@@ -13,6 +13,8 @@ use tokio::time::{Duration, interval};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use axon_core::{Bar, Price, Quantity, Timestamp};
+
 use crate::error::ExchangeError;
 use crate::sign;
 use crate::traits::ExchangeAdapter;
@@ -978,6 +980,54 @@ impl ExchangeAdapter for BinanceAdapter {
                 .unwrap_or(1.0),
             timestamp_ms: entry["timestamp"].as_i64().unwrap_or(0),
         })
+    }
+
+    async fn fetch_ohlcv(
+        &self,
+        symbol: &Symbol,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Bar>, ExchangeError> {
+        // klines 是公开接口，优先用合约域（配置了 fapi_base_url 时），否则现货域
+        let (base_url, path) = if self.config.fapi_base_url.is_some() {
+            (self.fapi_base_url(), "/fapi/v1/klines")
+        } else {
+            (self.config.rest_base_url.as_str(), "/api/v3/klines")
+        };
+        let url = format!("{base_url}{path}?symbol={symbol}&interval={interval}&limit={limit}");
+        let resp = self.client.get(&url).send().await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let code = body["code"].as_i64().unwrap_or(-1);
+            let msg = body["msg"].as_str().unwrap_or("unknown error");
+            return Err(ExchangeError::ApiError {
+                code: code as i32,
+                message: msg.to_string(),
+            });
+        }
+
+        let arr = body.as_array().ok_or_else(|| {
+            ExchangeError::ParseError("fetch_ohlcv: response is not an array".into())
+        })?;
+
+        let bars: Vec<Bar> = arr
+            .iter()
+            .filter_map(|k| {
+                // Binance kline: [open_time, open, high, low, close, volume, ...]
+                let open_time = k.get(0)?.as_i64()?;
+                Some(Bar {
+                    timestamp: Timestamp::from_millis(open_time),
+                    open: Price::from_f64(k.get(1)?.as_str()?.parse().ok()?),
+                    high: Price::from_f64(k.get(2)?.as_str()?.parse().ok()?),
+                    low: Price::from_f64(k.get(3)?.as_str()?.parse().ok()?),
+                    close: Price::from_f64(k.get(4)?.as_str()?.parse().ok()?),
+                    volume: Quantity::from_f64(k.get(5)?.as_str()?.parse().ok()?),
+                })
+            })
+            .collect();
+
+        Ok(bars)
     }
 }
 

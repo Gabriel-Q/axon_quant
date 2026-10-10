@@ -118,6 +118,14 @@ axon-llm(基础设施 — 0.11.0 新增)
 ├── backends::openai_compat ─ OpenAICompatProvider (E10)
 ├── meter ─────────────── TokenMeter / TokenBudget / TokenReport (E12)
 └── cost ──────────────── MODEL_PRICING 估算表
+
+axon-llm(decision 子模块 — 0.15.0 新增)
+├── decision::backend ─── DecisionBackend trait / DecisionError
+├── decision::types ───── DecisionRequest / CascadeDecision / Question(noul/choice/score)
+├── decision::stub / replay / http ─ 三个后端实现
+├── decision::cascade ─── SdmCascadeDecisionLayer / FallbackDecider / RuleFallback
+├── decision::llm_fallback ─ LlmFallback(包装 LLMBackend)
+└── python::decision ──── PyDecisionBackend / PyCascadeLayer 绑定(axon_quant.decision)
 ```
 
 ## 下一步

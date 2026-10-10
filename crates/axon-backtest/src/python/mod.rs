@@ -39,6 +39,7 @@
 pub mod engine;
 pub mod error;
 pub mod impact;
+pub mod kline_buffer;
 pub mod matching;
 pub mod matching_l1;
 pub mod matching_l2;
@@ -68,6 +69,7 @@ pub fn register_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     matching_l3::register(parent)?;
     impact::register(parent)?;
     engine::register(parent)?;
+    kline_buffer::register(parent)?;
     Ok(())
 }
 

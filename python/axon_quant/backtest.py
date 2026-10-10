@@ -160,6 +160,7 @@ DarkOrder = _native_backtest_module.DarkOrder
 CrossPair = _native_backtest_module.CrossPair
 AuctionResult = _native_backtest_module.AuctionResult
 ArbitrageOpportunity = _native_backtest_module.ArbitrageOpportunity
+KlineBuffer = _native_backtest_module.KlineBuffer
 
 # 异常:BacktestError 继承 builtin `PyException`(避免 cargo 循环,见
 # `.axon-internal/specs/2026-06-19-python-bindings-expansion-design.md` §3.1.6)

@@ -28,7 +28,7 @@
 - `crates/axon-core/src/lib.rs` — 公开 re-export
 - `crates/axon-core/src/time/` — `Timestamp` / `MonotonicClock` / `TimePrecision`
 - `crates/axon-core/src/types/` — `Price` / `Quantity` / `Symbol`
-- `crates/axon-core/src/market/` — `Tick` / `Bar` / `OrderBookSnapshot` / `Trade`
+- `crates/axon-core/src/market/` — `Tick` / `Bar` / `OrderBookSnapshot` / `Trade` / `KlineBuffer`（`0.16.0` 新增，滚动 K 线缓冲）
 - `crates/axon-core/src/order/` — `Order` / `OrderType` / `TimeInForce` / `OrderStatus` 状态机
 - `crates/axon-core/src/event/` — `Event` / `EventBuilder` / `EventRouter` / `EventHandler`
 - `crates/axon-core/src/queue/` — `EventQueue`（按时间戳排序的优先队列）
@@ -88,6 +88,20 @@ bt.push_event({
     "order": limit_order(1, spot_instrument("BTC", "USDT"), "Buy", 100.0, 1.0),  # 0.5.0 起:instrument 字典代替旧 "BTCUSDT" 字符串
 })
 result = bt.run()
+```
+
+**`KlineBuffer`（`0.16.0` 新增，实盘因子注入用）：**
+
+```python
+from axon_quant.backtest import KlineBuffer
+
+buf = KlineBuffer("1h", 1000)                       # 周期 + 最大长度
+buf.load_history([{                                  # 启动时灌历史 K 线（纳秒时间戳）
+    "timestamp": 1_700_000_000_000_000_000,
+    "open": 60000.0, "high": 60100.0, "low": 59900.0, "close": 60050.0, "volume": 100.0,
+}])
+buf.push_tick(timestamp_ns=1_700_003_600_000_000_000, price=61000.0)  # 实时更新，自动跨周期收盘
+bars = buf.bars()                                    # list[dict]，供因子计算读取
 ```
 
 **Rust 侧（开发新 crate / 集成测试时使用）：**
@@ -817,8 +831,15 @@ LLM 智能体：ReAct 推理循环 + Tool Calling + 上下文窗口 + 三个内�
   - `vote.rs` — 投票策略（`HardVote` / `SoftVote` / `WeightedVote`）
   - `paper_trading.rs` — 模拟交易后端
 - `crates/axon-llm/src/backends/` — LLM 后端：`OpenAICompat` / `Mock` / `Recording` / `Retry` / `Cost` / `Streaming`
+- `crates/axon-llm/src/decision/` — SDM 结构化决策层（`0.15.0` 新增）
+  - `backend.rs` — `DecisionBackend` trait + `DecisionError`
+  - `types.rs` — `DecisionRequest` / `DecisionResponse` / `CascadeDecision` / 三种 `Question`（noul / choice / score）
+  - `stub.rs` / `replay.rs` / `http.rs` — 三个后端实现（确定性模拟 / 请求指纹回放 / 真实 HTTP）
+  - `cascade.rs` — `SdmCascadeDecisionLayer`（置信门控级联）+ `FallbackDecider` / `RuleFallback`
+  - `llm_fallback.rs` — `LlmFallback`（包装 `LLMBackend`，打通 SDM→LLM 升级闭环）
+  - `fingerprint.rs` — `canonical_request` + sha256（录制回放跨语言一致）
 - `crates/axon-llm/src/explain/` — 决策解释桥接（与 `axon-explain` 集成）
-- `crates/axon-llm/src/python/` — PyO3 绑定：`PyReActAgent` / `PyTrajectoryRecorder` / `PySwarmOrchestrator` / `PyBacktestTradingBackend`
+- `crates/axon-llm/src/python/` — PyO3 绑定：`PyReActAgent` / `PyTrajectoryRecorder` / `PySwarmOrchestrator` / `PyBacktestTradingBackend` / `decision`（SDM 决策层）
 
 ### 核心机制
 - **ReAct 循环**：`ReActAgent::run(input)` 循环：LLM 返回 Thought → Action → Observation → 再次 Thought → …，直到 `FinishReason`
@@ -828,6 +849,7 @@ LLM 智能体：ReAct 推理循环 + Tool Calling + 上下文窗口 + 三个内�
 - **录制回放**：`backends/recording.rs` 录制请求/响应用于 e2e 测试
 - **轨迹记录**：`TrajectoryRecorder` 记录每步 LLM 交互（thought/action/observation/reward），输出 JSON 文件（schema v0.11.0）
 - **Token 计量**：`TokenMeter` 追踪每 agent token 用量，`TokenBudget` 超阈值预警；内置 `MODEL_PRICING` 表估算成本
+- **SDM 决策层**（`0.15.0`）：`DecisionBackend` 与 `LLMBackend` 并列；`SdmCascadeDecisionLayer` 做置信门控——高置信 SDM 直出，低置信/异常走 `FallbackDecider`（`RuleFallback` 或 `LlmFallback`）；`canonical_request` + sha256 保证录制回放跨语言一致
 
 ### 适用场景
 - 用 LLM 解读行情并下单（`ReActAgent` + `PlaceOrderTool`）
@@ -894,6 +916,19 @@ orchestrator = SwarmOrchestrator(
 )
 decision = orchestrator.run({"symbol": "BTC-USDT", "market": bars[-100:]})
 print(decision.action, decision.confidence, decision.votes)
+
+# ─── 场景 4：SDM 结构化决策层（0.15.0，置信门控 + 兜底）──────────
+from axon_quant.decision import (
+    make_decision_backend, SdmCascadeDecisionLayer, CascadeConfig, RuleFallback,
+)
+
+backend = make_decision_backend({"mode": "stub"})          # stub / replay / http
+layer = SdmCascadeDecisionLayer(backend, RuleFallback(), CascadeConfig())
+d = layer.decide(
+    {"symbol": "BTC-USDT", "price": 60000.0},
+    [{"kind": "choice", "name": "action", "options": ["buy", "hold", "sell"]}],
+)
+print(d["action"], d["source"], d["confidence"])           # source: sdm_direct / fallback
 ```
 
 **Rust 侧（开发新 Tool / 新后端时使用）：**
@@ -1654,6 +1689,9 @@ adapter.replace_order(order_id, new_price="50100", new_quantity="0.1")
 # 4) 查询订单状态 / 历史
 status = adapter.get_order_status(order_id)
 open_orders = adapter.get_open_orders("BTCUSDT")
+
+# 4.5) 拉历史 K 线(0.16.0 新增,用于实盘因子注入填充 KlineBuffer)
+history = adapter.fetch_ohlcv("BTCUSDT", "1h", 500)   # list[dict],timestamp 为毫秒
 
 # 5) 订单生命周期本地管理(崩溃恢复)
 mgr = OrderLifecycleManager()

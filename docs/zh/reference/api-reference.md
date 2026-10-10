@@ -492,6 +492,9 @@ print(f"总余额: {account.total_balance}, 可用: {account.available_balance}"
 # 查询资金费率
 funding = await adapter.get_funding_rate("BTCUSDT")
 print(f"资金费率: {funding.rate}, 下次结算: {funding.next_funding_ms}")
+
+# 拉历史 K 线(0.16.0 新增,用于实盘因子注入填充 KlineBuffer)
+history = adapter.fetch_ohlcv("BTCUSDT", "1h", 500)   # list[dict],timestamp 为毫秒
 ```
 
 ---

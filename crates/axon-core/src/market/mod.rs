@@ -6,6 +6,7 @@
 
 pub mod bar;
 pub mod error;
+pub mod kline_buffer;
 pub mod orderbook;
 pub mod side;
 pub mod tick;
@@ -13,6 +14,7 @@ pub mod trade;
 
 pub use bar::{Bar, BarPeriod};
 pub use error::{MarketDataError, MarketDataResult};
+pub use kline_buffer::KlineBuffer;
 pub use orderbook::{OrderBookLevel, OrderBookSnapshot};
 pub use side::Side;
 pub use tick::Tick;

@@ -135,6 +135,14 @@ impl ExchangeAdapter for MockExchangeAdapter {
     ) -> Result<axon_exchange::LongShortRatio, ExchangeError> {
         Err(ExchangeError::ParseError("not supported".into()))
     }
+    async fn fetch_ohlcv(
+        &self,
+        _symbol: &Symbol,
+        _interval: &str,
+        _limit: usize,
+    ) -> Result<Vec<axon_core::Bar>, ExchangeError> {
+        Ok(Vec::new())
+    }
 }
 
 fn make_buy_args(symbol: &str, qty: f64, price: f64) -> PlaceOrderArgs {
