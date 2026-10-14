@@ -17,7 +17,10 @@ sha2 = "0.10"
 pyo3 = { version = "0.28", features = ["auto-initialize"], optional = true }
 
 # 可选后端依赖
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "load-dynamic", "tls-rustls"] }
+# 精确 pin 预发布版本：ort rc 系列不保证 API 兼容（rc.14 的 Session::builder
+# 签名已变为需要 &Environment 参数），宽松约束会让 CI 全新解析时漂移到新 rc
+# 导致编译失败，等正式版发布后再恢复普通 semver 约束
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "api-24", "load-dynamic", "tls-rustls"] }
 tch = { version = "0.24", optional = true }
 candle-core = { version = "0.10", optional = true }
 candle-nn = { version = "0.10", optional = true }

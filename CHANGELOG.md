@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **回测成交记录时间戳错误地使用墙上时钟**：`BacktestEngine::apply_fill` 生成 `TradeRecord`、持仓入场时间（`entry_time_ns`）和 fill NAV 曲线时，误用 `MatchFill.timestamp`（即订单 `created_at: Timestamp::now()`，真实墙上时钟）。在逐 bar 步进驱动（`begin_bar` + `step`，不走 `run()` 事件循环）的回测中，模拟时钟不会按事件自动推进，导致所有成交都记成回测运行的当下时刻且几乎同一秒，而非对应 K 线的历史时间。现统一改用模拟时钟 `clock.now()`，与同函数内 `FillRecord` 的审计时间语义保持一致。
+- **Python wheel 构建在 CI 全新环境编译失败（E0061）**：`axon-inference` 的 ONNX 后端依赖 `ort 2.0.0-rc.12` 使用了宽松版本约束，CI 无 `Cargo.lock` 全新解析时漂移到 `2.0.0-rc.14`，其 `Session::builder()` 签名变为需要 `&Environment` 参数，导致 `onnx.rs` 两处调用编译失败（该问题只在 `--features python`/`onnx` 构建中暴露，默认测试不编译 ONNX 后端）。现精确 pin 为 `=2.0.0-rc.12`，待 ort 发布 API 稳定的正式版后再恢复 semver 约束。
 
 ## [0.16.0] - 2026-10-10
 
