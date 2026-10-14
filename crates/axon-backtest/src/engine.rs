@@ -1367,7 +1367,10 @@ impl BacktestEngine {
     ) {
         let fill_price = fill.price.as_f64();
         let fill_qty = fill.quantity.as_f64();
-        let timestamp = fill.timestamp;
+        // 成交/持仓/NAV 的审计时间统一用模拟时钟（= 当前 bar 的事件时间）。
+        // fill.timestamp 是订单 created_at(Timestamp::now() 墙上时钟)，
+        // 回测中所有订单几乎同一瞬间创建，直接使用会让成交记录全部记成回测运行时刻。
+        let timestamp = self.config.clock.now();
 
         // ── 1. 现金 + 手续费 ────────────────────────────
         let notional = fill_price * fill_qty;

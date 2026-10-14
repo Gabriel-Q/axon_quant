@@ -6,6 +6,12 @@ All notable changes to AXON will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-10-14
+
+### Fixed
+
+- **回测成交记录时间戳错误地使用墙上时钟**：`BacktestEngine::apply_fill` 生成 `TradeRecord`、持仓入场时间（`entry_time_ns`）和 fill NAV 曲线时，误用 `MatchFill.timestamp`（即订单 `created_at: Timestamp::now()`，真实墙上时钟）。在逐 bar 步进驱动（`begin_bar` + `step`，不走 `run()` 事件循环）的回测中，模拟时钟不会按事件自动推进，导致所有成交都记成回测运行的当下时刻且几乎同一秒，而非对应 K 线的历史时间。现统一改用模拟时钟 `clock.now()`，与同函数内 `FillRecord` 的审计时间语义保持一致。
+
 ## [0.16.0] - 2026-10-10
 
 ### Added
