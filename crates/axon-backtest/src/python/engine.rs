@@ -870,7 +870,7 @@ impl PyRunResult {
     /// 完整交易记录(开/平仓配对的 TradeRecord 列表)
     #[getter]
     fn trades<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        // ponytail:简化为 dict 列表(每个 TradeRecord → 8 字段 dict)
+        // ponytail:简化为 dict 列表(每个 TradeRecord → dict)
         // 若 quantcell 需要 Arrow / numpy 可后续加 trades_arrow
         let list = PyList::empty(py);
         for tr in &self.inner.trades {
@@ -883,6 +883,9 @@ impl PyRunResult {
             d.set_item("realized_pnl", tr.realized_pnl as f64 / 1e6)?;
             d.set_item("commission", tr.commission as f64 / 1e6)?;
             d.set_item("net_quantity", tr.net_quantity as f64 / 1e6)?;
+            // T0.17 新增:开仓均价(f64)与首次开仓时间(纳秒)
+            d.set_item("entry_price", tr.entry_price as f64 / 1e6)?;
+            d.set_item("entry_time_ns", tr.entry_time_ns)?;
             list.append(d)?;
         }
         Ok(list)
