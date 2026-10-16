@@ -26,7 +26,9 @@ jobs:
         with:
           workspaces: "target -> .cargo/audit-cache"
       - name: Run benchmarks (--quick)
-        run: cargo bench -p axon-data --features csv-source --bench axon_data_bench -- --quick
+        # --locked 强制使用已提交的 Cargo.lock:tch 依赖的 zip 0.6.x 已被 yanked,
+        # 全新解析会失败;锁文件中的 yanked 版本仍可正常下载。
+        run: cargo bench -p axon-data --features csv-source --bench axon_data_bench --locked -- --quick
       - name: Upload benchmark report
         uses: actions/upload-artifact@v4
         with:
