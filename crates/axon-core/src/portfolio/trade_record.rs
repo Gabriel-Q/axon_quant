@@ -25,6 +25,15 @@ pub struct TradeRecord {
     /// - 后期 report / PnL 拆分(per-instrument 累计)直接用此字段
     #[serde(default)]
     pub instrument: Instrument,
+    /// T0.17 新增:开仓均价(单位 f64 × 1e6),取 PositionState.avg_cost
+    ///
+    /// 与引擎 realized_pnl 口径一致(均用 avg_cost 而非逐笔 FIFO 开仓价),
+    /// 保证 Σ trade.realized_pnl == result.total_pnl。
+    #[serde(default)]
+    pub entry_price: i64,
+    /// T0.17 新增:首次开仓时间(纳秒),取 PositionState.entry_time_ns
+    #[serde(default)]
+    pub entry_time_ns: i64,
 }
 
 impl TradeRecord {
@@ -36,13 +45,17 @@ impl TradeRecord {
     /// - `realized_pnl`:已实现盈亏(单位 f64 × 1e6)
     /// - `commission`:佣金(单位 f64 × 1e6)
     /// - `net_quantity`:净数量(带方向符号,f64 × 1e6)
-    /// - `instrument`:T2.4 新增,成交所属的 Instrument
+    /// - `instrument`:成交所属的 Instrument
+    /// - `entry_price`:开仓均价(单位 f64 × 1e6,PositionState.avg_cost)
+    /// - `entry_time_ns`:首次开仓时间(纳秒,PositionState.entry_time_ns)
     pub fn new(
         trade: Trade,
         realized_pnl: i64,
         commission: i64,
         net_quantity: i64,
         instrument: Instrument,
+        entry_price: i64,
+        entry_time_ns: i64,
     ) -> Self {
         Self {
             trade,
@@ -50,6 +63,8 @@ impl TradeRecord {
             commission,
             net_quantity,
             instrument,
+            entry_price,
+            entry_time_ns,
         }
     }
 }
@@ -76,9 +91,19 @@ mod tests {
             1,
             2,
         );
-        let rec = TradeRecord::new(trade, 1_000_000, 100_000, 1_000_000, btc_usdt());
+        let rec = TradeRecord::new(
+            trade,
+            1_000_000,
+            100_000,
+            1_000_000,
+            btc_usdt(),
+            10_000_000,
+            1_000,
+        );
         assert_eq!(rec.realized_pnl, 1_000_000);
         assert_eq!(rec.commission, 100_000);
         assert_eq!(rec.instrument, btc_usdt());
+        assert_eq!(rec.entry_price, 10_000_000);
+        assert_eq!(rec.entry_time_ns, 1_000);
     }
 }

@@ -1441,6 +1441,9 @@ impl BacktestEngine {
                 self.bt_state
                     .trading_metrics
                     .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                // 开仓均价/时间必须在清仓前读取(avg_cost 会被置 0)
+                let entry_price = (pos.avg_cost * 1e6) as i64;
+                let entry_time_ns = pos.entry_time_ns;
                 let trade = Trade::new(
                     timestamp,
                     fill.price,
@@ -1454,6 +1457,8 @@ impl BacktestEngine {
                     (fee * 1e6) as i64,
                     (n * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
+                    entry_price,
+                    entry_time_ns,
                 ));
                 // 清仓
                 pos.quantity = 0.0;
@@ -1474,6 +1479,9 @@ impl BacktestEngine {
                 self.bt_state
                     .trading_metrics
                     .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                // 部分平仓:开仓均价/时间取自当前持仓(avg_cost 未被清)
+                let entry_price = (pos.avg_cost * 1e6) as i64;
+                let entry_time_ns = pos.entry_time_ns;
                 // 平仓的 TradeRecord(净量 = n,即本次 fill 方向)
                 let close_trade = Trade::new(
                     timestamp,
@@ -1488,6 +1496,8 @@ impl BacktestEngine {
                     (fee * 1e6) as i64,
                     (n * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
+                    entry_price,
+                    entry_time_ns,
                 ));
                 // 留 p+n(同 n 方向,幅值 = |p|-|n|)
                 pos.quantity = p + n;
@@ -1501,6 +1511,9 @@ impl BacktestEngine {
                 self.bt_state
                     .trading_metrics
                     .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                // 反手:平掉旧仓的开仓均价/时间取自旧持仓(反手后会被新仓覆盖)
+                let entry_price = (pos.avg_cost * 1e6) as i64;
+                let entry_time_ns = pos.entry_time_ns;
                 let close_trade = Trade::new(
                     timestamp,
                     fill.price,
@@ -1514,6 +1527,8 @@ impl BacktestEngine {
                     (fee * 1e6) as i64,
                     (-p * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
+                    entry_price,
+                    entry_time_ns,
                 ));
                 // 开反向 n + p
                 pos.quantity = n + p;
