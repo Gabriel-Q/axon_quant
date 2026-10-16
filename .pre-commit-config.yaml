@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      # 自动格式化(失败时会被 pre-commit 重新暂存)
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        always_run: true
+        pass_filenames: false
+
+      # clippy 作为 CI 等价校验(慢,但必须过;可 SKIP=1 git commit 临时跳过)
+      - id: cargo-clippy
+        name: cargo clippy --locked
+        entry: cargo clippy --workspace --all-targets --locked -- -D warnings
+        language: system
+        always_run: true
+        pass_filenames: false
