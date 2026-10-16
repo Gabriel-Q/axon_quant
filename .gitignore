@@ -44,7 +44,9 @@ logs/
 # proptest 回归案例(由 proptest 自动管理,不进入版本控制)
 **/proptest-regressions/
 
-Cargo.lock
+# Cargo.lock 必须提交:workspace 含 axon-cli 二进制,且 tch 0.24/0.26 依赖的
+# zip 0.6.x 已全部被 crates.io yanked。不提交锁文件会导致 CI 全新解析失败。
+# yanked crate 只要在 Cargo.lock 中仍可下载,仅阻止新解析选中。
 
 # Python 包(axon_quant)构建产物 — 源码仍需进版本控制,只忽略产物
 # 见 `make python-clean` 与 `python/axon_quant/*.so` / `__pycache__` / `_native*.so`

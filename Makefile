@@ -228,7 +228,12 @@ toolchain-check: ## 检查本地 stable 是否过期(>14 天则警告)
 	fi
 
 .PHONY: verify
-verify: toolchain-check fmt-check clippy test build ## 完整本地验证（等价于 CI）
+verify: toolchain-check fmt-check ## 完整本地验证（等价于 CI）
+	# clippy/test/build 显式加 --locked,与 CI 行为一致:tch 依赖的 zip 0.6.x 已被 yanked,
+	# 无锁文件时全新解析会失败。日常开发用 make build/test/clippy(不带 --locked)即可。
+	cargo clippy --workspace --all-targets --locked -- $(RUSTFLAGS)
+	cargo test --workspace --locked
+	cargo build --workspace --locked
 	@echo "✅ 所有本地检查通过"
 
 .PHONY: ci-check

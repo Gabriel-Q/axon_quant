@@ -78,6 +78,7 @@ jobs:
             --test e2e_tool_calling_test \
             --test e2e_react_loop_test \
             --test e2e_explain_e2e_test \
+            --locked \
             -- --nocapture --test-threads=1
 
       - name: Skip notice (no API key)
