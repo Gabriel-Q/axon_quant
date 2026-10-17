@@ -95,6 +95,7 @@ impl TokenInfo {
 #[derive(Debug, Clone)]
 pub struct Erc20Client {
     info: TokenInfo,
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     provider: EvmProvider,
 }
 

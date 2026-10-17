@@ -42,6 +42,7 @@ pub struct PoolState {
 /// V3 池子客户端
 #[derive(Clone)]
 pub struct V3Pool {
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     provider: EvmProvider,
     pool_address: String,
     chain: Chain,

@@ -58,6 +58,7 @@ pub struct LocalSigner {
     inner: PrivateKeySigner,
 }
 
+/// 非 evm feature 下的本地 Signer stub(仅维护 nonce,不做真实链上签名)
 #[cfg(not(feature = "evm"))]
 #[derive(Debug, Clone)]
 pub struct LocalSigner {

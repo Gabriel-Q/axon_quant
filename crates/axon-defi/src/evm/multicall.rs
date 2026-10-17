@@ -101,6 +101,7 @@ fn hex_decode(s: &str) -> Vec<u8> {
 }
 
 /// bytes → hex 字符串("0x" 前缀)
+#[cfg(feature = "evm")]
 fn hex_encode(b: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(2 + b.len() * 2);
@@ -134,6 +135,7 @@ pub struct CallResult {
 /// Multicall 客户端
 #[derive(Debug, Clone)]
 pub struct Multicall {
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     provider: EvmProvider,
     chain: Chain,
 }
