@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use axon_core::market::bar::Bar;
 use axon_llm::decision::Action;
 
 /// 策略运行时上下文（回测/实盘通用）
@@ -15,6 +16,8 @@ pub struct BarContext<'a> {
     pub symbol: &'a str,
     pub bar_index: u64,
     pub timestamp_ns: u64,
+    /// 当前 bar（OHLCV），Python 策略适配器需要完整 bar 数据
+    pub bar: &'a Bar,
     /// 预计算的 state（features + window），由 BacktestRunner 负责构造
     pub state: &'a serde_json::Value,
 }
@@ -61,6 +64,8 @@ pub struct StrategyDecision {
     pub action: Action,
     /// 置信度（SDM 校准值；规则策略为 0.0）
     pub confidence: f64,
+    /// 目标仓位（-1.0 ~ 1.0；None 时由 BacktestRunner 按 action 推导：Buy→1.0, Sell→-1.0, Hold→0.0）
+    pub target_position: Option<f64>,
     /// 决策来源（sdm_direct / fallback / rule）
     pub source: String,
     /// 买入/卖出/观望三键概率分布（规则策略为 None）
@@ -76,6 +81,7 @@ impl StrategyDecision {
         Self {
             action: cascade.action,
             confidence: cascade.confidence,
+            target_position: None,
             source: match cascade.source {
                 axon_llm::decision::DecisionSource::SdmDirect => "sdm_direct",
                 axon_llm::decision::DecisionSource::Fallback => "fallback",
@@ -91,10 +97,23 @@ impl StrategyDecision {
         Self {
             action,
             confidence: 0.0,
+            target_position: None,
             source: "rule".into(),
             probabilities: None,
             sub_signals: BTreeMap::new(),
             reason: None,
         }
+    }
+
+    /// 设置置信度（builder 风格）
+    pub fn with_confidence(mut self, c: f64) -> Self {
+        self.confidence = c;
+        self
+    }
+
+    /// 设置目标仓位（builder 风格）
+    pub fn with_target_position(mut self, t: f64) -> Self {
+        self.target_position = Some(t);
+        self
     }
 }

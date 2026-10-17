@@ -13,6 +13,13 @@ use axon_llm::decision::*;
 use serde::Deserialize;
 use serde_json::Value;
 
+#[cfg(feature = "python")]
+use axon_core::market::bar::Bar;
+#[cfg(feature = "python")]
+use pyo3::Python;
+#[cfg(feature = "python")]
+use pyo3::types::PyAnyMethods;
+
 use crate::trait_::{BarContext, Strategy, StrategyDecision, StrategyError};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -263,16 +270,148 @@ impl Strategy for SwarmRouteStrategyImpl {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// 4. PythonStrategyImpl — Python 策略适配器（桥接 Python on_bar/decide）
+// ──────────────────────────────────────────────────────────────────────
+
+/// Python 策略适配器：把 Python 对象的 `decide(bar_dict)` / `on_bar(bar_dict)` 方法
+/// 桥接到 Rust `Strategy` trait，让 QuantCell 自定义 Python 策略能跑在 Rust BacktestRunner 上。
+///
+/// Python 侧契约：
+/// - 方法名：`decide` 或 `on_bar`（优先 decide）
+/// - 入参：`bar: dict`（含 timestamp/open/high/low/close/volume）
+/// - 返回：dict 或对象，含 `action_type`("buy"/"sell"/"hold")/`confidence`/`target_position`
+#[cfg(feature = "python")]
+pub struct PythonStrategyImpl {
+    name: String,
+    symbol: String,
+    py_obj: pyo3::Py<pyo3::PyAny>,
+}
+
+#[cfg(feature = "python")]
+impl PythonStrategyImpl {
+    pub fn new(
+        name: impl Into<String>,
+        symbol: impl Into<String>,
+        py_obj: pyo3::Py<pyo3::PyAny>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            symbol: symbol.into(),
+            py_obj,
+        }
+    }
+
+    /// 把 Rust Bar 转成 Python dict（timestamp 用纳秒 int）
+    fn bar_to_py_dict<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+        bar: &Bar,
+    ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("timestamp", bar.timestamp.nanos)?;
+        d.set_item("open", bar.open.as_f64())?;
+        d.set_item("high", bar.high.as_f64())?;
+        d.set_item("low", bar.low.as_f64())?;
+        d.set_item("close", bar.close.as_f64())?;
+        d.set_item("volume", bar.volume.as_f64())?;
+        d.set_item("symbol", &self.symbol)?;
+        Ok(d)
+    }
+}
+
+#[cfg(feature = "python")]
+#[async_trait]
+impl Strategy for PythonStrategyImpl {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    async fn decide(&self, ctx: &BarContext<'_>) -> Result<StrategyDecision, StrategyError> {
+        // 获取 GIL，同步调用 Python 策略方法（回测是 block_on，无并发 GIL 争用）
+        let result = Python::attach(|py| -> Result<StrategyDecision, StrategyError> {
+            let bar_dict = self
+                .bar_to_py_dict(py, ctx.bar)
+                .map_err(|e| StrategyError::Logic(format!("bar→dict 失败: {e}")))?;
+
+            // 优先 decide，回退 on_bar
+            let bound = self.py_obj.bind(py);
+            let method = bound
+                .getattr("decide")
+                .or_else(|_| bound.getattr("on_bar"))
+                .map_err(|e| StrategyError::Logic(format!("策略无 decide/on_bar 方法: {e}")))?;
+
+            let ret = method
+                .call1((bar_dict,))
+                .map_err(|e| StrategyError::Logic(format!("Python 策略调用失败: {e}")))?;
+
+            // 解析返回：支持 dict 或带属性的对象
+            let get_str = |key: &str| -> Option<String> {
+                ret.getattr(key)
+                    .and_then(|v| v.extract::<String>())
+                    .or_else(|_| ret.get_item(key).and_then(|v| v.extract::<String>()))
+                    .ok()
+            };
+            let get_f64 = |key: &str| -> Option<f64> {
+                ret.getattr(key)
+                    .and_then(|v| v.extract::<f64>())
+                    .or_else(|_| ret.get_item(key).and_then(|v| v.extract::<f64>()))
+                    .ok()
+            };
+
+            let action_type = get_str("action_type").unwrap_or_else(|| "hold".to_string());
+            let confidence = get_f64("confidence").unwrap_or(0.0);
+            let target = get_f64("target_position").unwrap_or(0.0);
+
+            let action = match action_type.as_str() {
+                "buy" => Action::Buy,
+                "sell" => Action::Sell,
+                _ => Action::Hold,
+            };
+
+            Ok(StrategyDecision::from_rule(action)
+                .with_confidence(confidence)
+                .with_target_position(target))
+        });
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axon_core::market::bar::Bar;
+    use axon_core::time::Timestamp;
+    use axon_core::types::{Price, Quantity};
     use serde_json::json;
 
+    /// 测试用静态 Bar（RuleStrategyImpl 不读 bar 数据，只看 state.features）
+    fn sample_bar() -> Bar {
+        Bar {
+            timestamp: Timestamp {
+                nanos: 1713300000000000000,
+            },
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(101.0),
+            low: Price::from_f64(99.0),
+            close: Price::from_f64(100.5),
+            volume: Quantity::from_f64(1000.0),
+        }
+    }
+
     fn sample_ctx<'a>(state: &'a Value) -> BarContext<'a> {
+        // ponytail: Box::leak 让 bar 活到 'static，测试用可接受
+        let bar: &'static Bar = Box::leak(Box::new(sample_bar()));
         BarContext {
             symbol: "BTCUSDT",
             bar_index: 42,
             timestamp_ns: 1713300000000000000,
+            bar,
             state,
         }
     }
@@ -314,6 +453,7 @@ mod tests {
                 Ok(StrategyDecision {
                     action: Action::Hold,
                     confidence: 0.5,
+                    target_position: None,
                     source: "low".into(),
                     probabilities: None,
                     sub_signals: BTreeMap::new(),
@@ -368,6 +508,7 @@ mod tests {
                 Ok(StrategyDecision {
                     action: Action::Sell,
                     confidence: 0.95,
+                    target_position: None,
                     source: "high".into(),
                     probabilities: None,
                     sub_signals: BTreeMap::new(),

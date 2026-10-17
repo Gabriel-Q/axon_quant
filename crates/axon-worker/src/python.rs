@@ -18,6 +18,7 @@ use pyo3::types::PyDict;
 use axon_core::market::bar::Bar;
 use axon_core::time::Timestamp;
 use axon_core::types::{Price, Quantity};
+use axon_strategy::impl_::PythonStrategyImpl;
 use axon_strategy::python::PyRuleStrategyImpl;
 use axon_strategy::trait_::Strategy;
 
@@ -109,15 +110,44 @@ impl PyBacktestRunner {
         })
     }
 
-    /// 注册一个策略（目前支持 RuleStrategyImpl）
-    fn add_strategy(&self, strategy: &Bound<'_, PyAny>) -> PyResult<()> {
-        // 尝试提取 PyRuleStrategyImpl（持有 Arc<dyn Strategy>）
-        let py_rule = strategy
-            .extract::<PyRef<'_, PyRuleStrategyImpl>>()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("仅支持 strategy.RuleStrategyImpl 实例")
-            })?;
-        let s: Arc<dyn Strategy> = py_rule.inner.clone();
+    /// 注册一个策略
+    ///
+    /// 支持两种类型：
+    /// - `strategy.RuleStrategyImpl` 实例（Rust 内置双均线策略）
+    /// - 任意 Python 对象，需实现 `decide(bar_dict)` 或 `on_bar(bar_dict)` 方法，
+    ///   返回含 `action_type`/`confidence`/`target_position` 的 dict 或对象
+    #[pyo3(signature = (strategy, name=None, symbol=None))]
+    fn add_strategy(
+        &self,
+        strategy: &Bound<'_, PyAny>,
+        name: Option<String>,
+        symbol: Option<String>,
+    ) -> PyResult<()> {
+        let s: Arc<dyn Strategy> =
+            if let Ok(py_rule) = strategy.extract::<PyRef<'_, PyRuleStrategyImpl>>() {
+                // Rust 内置策略：直接提取 Arc<dyn Strategy>
+                py_rule.inner.clone()
+            } else {
+                // Python 自定义策略：用 PythonStrategyImpl 包装
+                let name = name.unwrap_or_else(|| {
+                    strategy
+                        .getattr("name")
+                        .and_then(|v| v.extract::<String>())
+                        .unwrap_or_else(|_| "python_strategy".to_string())
+                });
+                let symbol = symbol.unwrap_or_else(|| {
+                    strategy
+                        .getattr("symbol")
+                        .and_then(|v| v.extract::<String>())
+                        .unwrap_or_else(|_| "UNKNOWN".to_string())
+                });
+                Arc::new(PythonStrategyImpl::new(
+                    name,
+                    symbol,
+                    strategy.clone().unbind(),
+                ))
+            };
+
         self.inner
             .lock()
             .map_err(|e| {

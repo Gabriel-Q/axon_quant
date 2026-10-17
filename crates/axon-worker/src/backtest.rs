@@ -157,6 +157,7 @@ impl BacktestRunner {
                     bar_index: bar_idx as u64,
                     // Phase 2 修复：用真实纳秒戳，之前是 RFC3339 字符串长度占位
                     timestamp_ns: bar.timestamp.nanos as u64,
+                    bar,
                     state: &state,
                 };
 
@@ -179,7 +180,10 @@ impl BacktestRunner {
 
                 // 仅 Ok 时 set_target_position（引擎用它撮合）
                 if let Ok(ref dec) = decision {
-                    let target = action_to_target(dec.action);
+                    // 优先用策略指定的 target_position，否则按 action 推导
+                    let target = dec
+                        .target_position
+                        .unwrap_or_else(|| action_to_target(dec.action));
                     if let Some(inst) = instruments.get(strategy.symbol()) {
                         engine.set_target_position(inst.clone(), target);
                     }
