@@ -80,6 +80,10 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Python 绑定（PyO3 0.28，所有 python feature crate 共享）
+# NOTE: 用 workspace 统一 pyo3 版本，避免各 crate 独立声明导致 Cargo.lock 分裂
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
 # 日志 / 追踪
 log = "0.4"
 tracing = "0.1"

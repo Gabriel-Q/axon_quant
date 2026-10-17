@@ -8,3 +8,6 @@ pub mod manager;
 
 pub use backtest::*;
 pub use manager::*;
+
+#[cfg(feature = "python")]
+pub mod python;

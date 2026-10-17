@@ -264,7 +264,7 @@ fn round_probs(obj: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::Answer;
+    use super::super::types::{Answer, Question};
     use super::*;
     use std::collections::BTreeMap;
 
@@ -278,6 +278,36 @@ mod tests {
             }),
             questions: BTreeMap::new(),
         }
+    }
+
+    /// 按实际类型表构造 v2 全问题集
+    fn v2_full_questions() -> BTreeMap<String, Question> {
+        [
+            ("next_direction", Question::blank("choice")),
+            ("trend_confirms", Question::blank("noul")),
+            ("risk_regime_bad", Question::blank("noul")),
+            ("signal_clarity", Question::blank("score")),
+            ("position_size", Question::blank("choice")),
+            ("volatility_regime", Question::blank("score")),
+            ("drawdown_risk", Question::blank("noul")),
+            ("execution_urgency", Question::blank("choice")),
+        ]
+        .into_iter()
+        .map(|(k, q)| (k.to_string(), q))
+        .collect()
+    }
+
+    /// 只含 v1 的 4 个问题
+    fn v1_only_questions() -> BTreeMap<String, Question> {
+        [
+            ("next_direction", Question::blank("choice")),
+            ("trend_confirms", Question::blank("noul")),
+            ("risk_regime_bad", Question::blank("noul")),
+            ("signal_clarity", Question::blank("score")),
+        ]
+        .into_iter()
+        .map(|(k, q)| (k.to_string(), q))
+        .collect()
     }
 
     #[tokio::test]
@@ -315,22 +345,9 @@ mod tests {
             "sma5_vs_sma20": 0.02, "volume_z": 0.5,
             "close_vs_sma20": 0.01, "rsi_14": 65.0, "volume_ratio": 1.2
         });
-        let mut qs = BTreeMap::new();
-        for k in [
-            "next_direction",
-            "trend_confirms",
-            "risk_regime_bad",
-            "signal_clarity",
-            "position_size",
-            "volatility_regime",
-            "drawdown_risk",
-            "execution_urgency",
-        ] {
-            qs.insert(k.to_string(), json!({"type": "choice"}));
-        }
         let req = DecisionRequest {
             state: json!({"features": features}),
-            questions: qs,
+            questions: v2_full_questions(),
         };
         let resp = StubDecisionBackend::new().decide(&req).await.unwrap();
 
@@ -379,18 +396,9 @@ mod tests {
             "ret_1": 0.01, "ret_5": 0.02, "vol_20": 0.01,
             "sma5_vs_sma20": 0.02, "volume_z": 0.5
         });
-        let mut qs = BTreeMap::new();
-        for k in [
-            "next_direction",
-            "trend_confirms",
-            "risk_regime_bad",
-            "signal_clarity",
-        ] {
-            qs.insert(k.to_string(), json!({"type": "choice"}));
-        }
         let req = DecisionRequest {
             state: json!({"features": features}),
-            questions: qs,
+            questions: v1_only_questions(),
         };
         let resp = StubDecisionBackend::new().decide(&req).await.unwrap();
 
