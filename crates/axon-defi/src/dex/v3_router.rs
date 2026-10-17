@@ -131,6 +131,7 @@ impl SwapParams {
 /// V3 SwapRouter02 客户端
 #[derive(Debug, Clone)]
 pub struct V3Router {
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     provider: EvmProvider,
     router_address: String,
     chain: Chain,

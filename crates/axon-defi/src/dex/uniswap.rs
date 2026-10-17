@@ -94,6 +94,7 @@ impl SwapRoute {
         u.to_string().parse::<f64>().unwrap_or(0.0)
     }
 
+    /// 非 evm feature 下 amount_out(字符串) → f64 的便捷解析
     #[cfg(not(feature = "evm"))]
     pub fn amount_out_f64(&self) -> f64 {
         self.amount_out.parse().unwrap_or(0.0)

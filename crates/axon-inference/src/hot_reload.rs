@@ -159,6 +159,7 @@ impl ModelHotReloader {
         Ok(handle)
     }
 
+    #[cfg(feature = "hot-reload")]
     async fn try_reload_static(
         backend: &Arc<RwLock<dyn InferenceEngine>>,
         config: &ModelConfig,

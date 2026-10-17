@@ -69,6 +69,7 @@ pub struct QuoteResult {
 /// V3 Quoter 客户端
 #[derive(Debug, Clone)]
 pub struct V3Quoter {
+    #[cfg_attr(not(feature = "evm"), allow(dead_code))]
     provider: EvmProvider,
     /// QuoterV2 合约地址(留作可覆盖,默认 [QUOTER_V2_ADDRESS])
     quoter_address: String,
