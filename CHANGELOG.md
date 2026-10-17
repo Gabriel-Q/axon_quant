@@ -19,13 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `axon-worker`：`BacktestRunner` 全 Rust 原生回测编排（逐 bar `decide` → `target_position` → `BacktestEngine` 真撮合）+ `StrategyManager` 单例注册表
     - 期货品种（`with_futures`）+ 逐 bar 资金费结算（`funding_by_symbol`，命中 bar 时刻即 `push_funding` + drain）
     - 逐 bar 状态注入：`states_by_symbol` 为列表时 `BarContext.state` 取第 i 项，`PythonStrategyImpl` 以 `bar["state"]` 透传给 Python 策略
+    - EOD 强制平仓（`with_force_liquidate`）
 - `StrategyDecision` 新增 `target_position` 字段与 `with_confidence` / `with_target_position` builder；`BarContext` 新增 `bar` 字段
 - `axon-llm` decision：`Question::blank(kind)` 测试 helper
 
 ### Python 绑定
 
 - `axon_quant.strategy`：`RuleStrategyImpl`、`BacktestRunnerConfig`
-- `axon_quant.worker`：`BacktestRunner(initial_cash, futures=False)`（`add_strategy` / `run`）、`BacktestResult`
+- `axon_quant.worker`：`BacktestRunner(initial_cash, futures=False, force_liquidate=False)`（`add_strategy` / `run`）、`BacktestResult`
   - `run(bars, states_by_symbol=None, funding_by_symbol=None)`：states 值为 list 时逐 bar 注入，为单对象时展开为「每 bar 同值」
   - `BacktestResult` 字段与 `RunResult` 对齐：`trades` / `fills_detail` / `equity_curve` / `bar_nav_curve` / `nav_peak` / `max_drawdown_pct` / `win_rate` / `sharpe_ratio` / `total_fees` / `final_positions` 等
 - 自定义 Python 策略无需基类，实现 `decide(bar)` / `on_bar(bar)` 即可注册到 `BacktestRunner`
@@ -33,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`BacktestRunner` 结果与 `BacktestLoop` 不一致**：逐 bar 顺序（`begin_bar` 提前到策略决策之前 + 决策后补显式 `rebalance_to_target`，复刻「有成交则次 bar、无成交则同 bar」的条件语义）与 seed 流动性常量（`half_spread` / `size_per_level` / `auto_rebalance`）对齐 QuantCell `BacktestLoop` 后，同一策略 + 数据下两条路径结果 **bit-identical**。
+- **`BacktestResult.final_positions` 的 contract_size 类型不符**：曾把 `contract_size` 序列化成字符串（`"1"`），与 Python 端 `RunResult.positions` 的浮点元组（`1.0`）不一致，导致期货持仓 key 不匹配。改为直接持有 `Instrument`，Python 绑定复用 `instrument_to_tuple` 生成与 `RunResult` 完全一致的元组。
 
 ## [0.16.1] - 2026-10-14
 
