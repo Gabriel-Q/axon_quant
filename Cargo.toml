@@ -4,6 +4,8 @@ resolver = "2"
 members = [
     "crates/axon-core",
     "crates/axon-backtest",
+    "crates/axon-strategy",
+    "crates/axon-worker",
     "crates/axon-rl",
     "crates/axon-hpo",
     "crates/axon-walk-forward",
@@ -45,6 +47,8 @@ authors = ["pengwow <pengwow@hotmail.com>"]
 # 内部 crate
 axon-core = { path = "crates/axon-core" }
 axon-backtest = { path = "crates/axon-backtest" }
+axon-strategy = { path = "crates/axon-strategy" }
+axon-worker = { path = "crates/axon-worker" }
 axon-rl = { path = "crates/axon-rl" }
 axon-hpo = { path = "crates/axon-hpo" }
 axon-walk-forward = { path = "crates/axon-walk-forward" }

@@ -217,7 +217,7 @@ fn mock_drawdown_risk(state: &serde_json::Value) -> serde_json::Value {
     let c20 = feature_opt(state, "close_vs_sma20");
     let base = if rsi > 70.0 || rsi < 30.0 { 0.7 } else { 0.3 };
     let base = if c20.abs() > 0.05 {
-        (base + 0.15).min(0.9)
+        (base + 0.15_f64).min(0.9)
     } else {
         base
     };
