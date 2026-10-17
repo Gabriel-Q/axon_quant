@@ -13,7 +13,7 @@ name = "axon_worker"
 [features]
 default = []
 # Python 绑定：axon-python 聚合时启用
-python = ["dep:pyo3"]
+python = ["dep:pyo3", "axon-strategy/python"]
 
 [dependencies]
 axon-core     = { workspace = true }

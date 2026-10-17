@@ -1,19 +1,28 @@
-//! axon-strategy Python 绑定（骨架级）
+//! axon-strategy Python 绑定
 //!
-//! 提供 `register_module` 把策略构造器 + BacktestRunnerConfig 挂到 `_native.strategy` 子模块。
-//! 真实策略实例化（SdmStrategyImpl 等）Phase 2 再做——当前只暴露配置 DTO。
+//! 暴露内置策略构造器（RuleStrategyImpl 等）+ BacktestRunnerConfig DTO。
+//! 策略实例以 `Arc<dyn Strategy>` 持有，可直接传给 `axon_worker.BacktestRunner.add_strategy`。
 
 #![cfg(feature = "python")]
+
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde_json::Value;
 
+use crate::impl_::RuleStrategyImpl;
+use crate::trait_::Strategy;
+
 /// Python 端 BacktestRunner 配置（DTO）
 ///
 /// 这是一个纯数据类，字段全部 Optional——Rust 侧会做默认填充。
 /// 由 Python 层序列化后传给 `BacktestRunner::from_config_json()`。
-#[pyclass(name = "BacktestRunnerConfig", module = "axon_strategy")]
+#[pyclass(
+    name = "BacktestRunnerConfig",
+    module = "axon_strategy",
+    skip_from_py_object
+)]
 #[derive(Clone, Default, Debug)]
 pub struct PyBacktestRunnerConfig {
     pub initial_cash: f64,
@@ -53,8 +62,39 @@ pub fn dict_to_json(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<Value>
     Ok(Value::Null)
 }
 
+/// Python 端 RuleStrategyImpl（双均线规则策略）
+///
+/// 持有 `Arc<dyn Strategy>`，可直接传给 BacktestRunner.add_strategy。
+#[pyclass(name = "RuleStrategyImpl", module = "axon_strategy", from_py_object)]
+#[derive(Clone)]
+pub struct PyRuleStrategyImpl {
+    /// 持有 `Arc<dyn Strategy>`，供 BacktestRunner.add_strategy 提取
+    pub inner: Arc<dyn Strategy>,
+}
+
+#[pymethods]
+impl PyRuleStrategyImpl {
+    /// 构造：双均线策略（name + symbol）
+    #[new]
+    #[pyo3(signature = (name, symbol))]
+    fn new(name: String, symbol: String) -> Self {
+        Self {
+            inner: Arc::new(RuleStrategyImpl::new(name, symbol)),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RuleStrategyImpl(name={}, symbol={})",
+            self.inner.name(),
+            self.inner.symbol()
+        )
+    }
+}
+
 /// 在给定 PyModule 上注册 axon_strategy 的 Python 绑定
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBacktestRunnerConfig>()?;
+    m.add_class::<PyRuleStrategyImpl>()?;
     Ok(())
 }
