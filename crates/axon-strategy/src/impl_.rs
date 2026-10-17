@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axon_core::harness_types::{AgentIntent, TaskContext};
+use axon_harness::{Adjudication, HarnessBridge};
 use axon_llm::decision::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -40,6 +42,9 @@ fn default_version() -> String {
 ///
 /// 把 DecisionBackend + SdmCascadeDecisionLayer + (可选) HarnessBridge
 /// 串成一个 Strategy。决策链路：SDM → Cascade gate → (可选) Harness → Action。
+///
+/// Harness 接入后，decide() 在 Cascade 出结果后会构造 AgentIntent/TaskContext
+/// 让 HarnessBridge adjudicate。默认 None 时跳过（回测场景一般不需要 Harness）。
 pub struct SdmStrategyImpl {
     name: String,
     symbol: String,
@@ -47,6 +52,8 @@ pub struct SdmStrategyImpl {
     questions: BTreeMap<String, Question>,
     #[allow(dead_code)]
     features_version: String,
+    /// 可选风控桥（回测时传 None；实盘接 CircuitBreaker/PositionGuard）
+    harness: Option<Arc<HarnessBridge>>,
 }
 
 impl SdmStrategyImpl {
@@ -54,6 +61,16 @@ impl SdmStrategyImpl {
         config: &SdmStrategyConfig,
         backend: Arc<dyn DecisionBackend>,
         questions_raw: BTreeMap<String, Value>,
+    ) -> Result<Self, String> {
+        Self::with_harness(config, backend, questions_raw, None)
+    }
+
+    /// 完整构造（带可选 HarnessBridge）
+    pub fn with_harness(
+        config: &SdmStrategyConfig,
+        backend: Arc<dyn DecisionBackend>,
+        questions_raw: BTreeMap<String, Value>,
+        harness: Option<Arc<HarnessBridge>>,
     ) -> Result<Self, String> {
         let cascade = Arc::new(SdmCascadeDecisionLayer::new(
             backend,
@@ -74,6 +91,7 @@ impl SdmStrategyImpl {
             cascade,
             questions,
             features_version: config.features_version.clone(),
+            harness,
         })
     }
 }
@@ -88,14 +106,47 @@ impl Strategy for SdmStrategyImpl {
     }
 
     async fn decide(&self, ctx: &BarContext<'_>) -> Result<StrategyDecision, StrategyError> {
+        // 1) SDM → Cascade gate（Backend 失败已被 Cascade 内部捕获并转为 Fallback）
         let req = DecisionRequest {
             state: ctx.state.clone(),
             questions: self.questions.clone(),
         };
-        // ponytail: Backend 所有失败已被 CascadeDecisionLayer 内部捕获并转为 Fallback，
-        // 所以这里 Result 层理论上不会 Err；但保留 match 防未来 cascade 升级。
         let cascade = self.cascade.decide(&req).await;
-        Ok(StrategyDecision::from_sdm(cascade))
+        let decision = StrategyDecision::from_sdm(cascade);
+
+        // 2) 可选：Harness 治理层（CircuitBreaker / PositionGuard）
+        // ponytail:回测时 harness=None 直接跳过；实盘接 HarnessBridge 后才 adjudicate
+        if let Some(h) = &self.harness {
+            let intent = AgentIntent {
+                action: format!("{:?}", decision.action).to_lowercase(),
+                tool: None,
+                params: Value::Null,
+                confidence: decision.confidence,
+                reasoning: decision.reason.clone().unwrap_or_default(),
+                estimated_tokens: 0,
+            };
+            let task_ctx = TaskContext {
+                step: ctx.bar_index as u32,
+                tokens_used: 0,
+                task_description: format!("bar {} symbol {}", ctx.bar_index, ctx.symbol),
+                current_agent: self.name.clone(),
+                started_at: ctx.timestamp_ns,
+                metadata: Value::Null,
+            };
+            match h.adjudicate(&intent, &task_ctx) {
+                Adjudication::Approved => {}
+                Adjudication::Rejected(reason) | Adjudication::NeedRevision(reason) => {
+                    return Err(StrategyError::HarnessRejected { reason });
+                }
+                Adjudication::CircuitBreak => {
+                    return Err(StrategyError::HarnessRejected {
+                        reason: "circuit breaker triggered".into(),
+                    });
+                }
+            }
+        }
+
+        Ok(decision)
     }
 }
 
