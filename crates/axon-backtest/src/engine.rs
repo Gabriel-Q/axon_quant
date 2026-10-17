@@ -1908,10 +1908,21 @@ impl BacktestEngine {
     /// - 旧实现把 `total_pnl` 当成"fill 维度 cash flow 累计"(buy=-notional, sell=+notional),
     ///   对未平仓 long 持仓会失真(把开仓花的现金误算成亏损);旧 `max_drawdown` 也是
     ///   基于该 cash flow,`pnl_peak - total_pnl` 同样失真。
-    /// - `max_drawdown`:基于 `equity_curve` 真实扫描计算,反映实际账户价值回撤。
+    /// - `max_drawdown`:基于主曲线(bar_nav_curve)真实扫描计算,反映实际账户价值回撤。
     fn build_result(&self, initial_cash: f64, duration: Duration) -> RunResult {
-        // 1. final_nav:equity_curve 最后一帧(mark-to-market);空时回退 initial_cash
-        let final_nav = if let Some((_, last_nav)) = self.bt_state.equity_curve.last() {
+        // 统一用 bar_nav_curve(每 bar 密集采样) 作为 NAV 主曲线:
+        // - 前端权益曲线直接展示 bar_nav_curve
+        // - final_nav / total_pnl / max_drawdown 必须与之一致,否则出现
+        //   "最终权益 999.9 但曲线末尾 995.06" 的口径矛盾
+        // - bar_nav_curve 为空时回退 equity_curve(事件稀疏曲线),再回退 initial_cash
+        let primary_curve: &[(Timestamp, f64)] = if !self.bt_state.bar_nav_curve.is_empty() {
+            &self.bt_state.bar_nav_curve
+        } else {
+            &self.bt_state.equity_curve
+        };
+
+        // 1. final_nav:主曲线最后一帧(mark-to-market)
+        let final_nav = if let Some((_, last_nav)) = primary_curve.last() {
             *last_nav
         } else {
             initial_cash
@@ -1919,15 +1930,15 @@ impl BacktestEngine {
         let final_time = self.config.clock.now();
 
         // 2. total_pnl:账户视角 = final_nav - initial_cash
-        //    (已实现 PnL 来自 trades;未实现 PnL 来自 equity_curve 末帧 mark;
+        //    (已实现 PnL 来自 trades;未实现 PnL 来自末帧 mark;
         //     手续费已扣 cash,自然包含)
         let total_pnl = final_nav - initial_cash;
 
-        // 3. max_drawdown:扫描 equity_curve 真实计算
+        // 3. max_drawdown:扫描主曲线真实计算
         //    ponytail:简单 O(n) 单次扫描,O(1) 空间
         let mut nav_peak = initial_cash;
         let mut max_drawdown: f64 = 0.0;
-        for (_, nav) in &self.bt_state.equity_curve {
+        for (_, nav) in primary_curve {
             if *nav > nav_peak {
                 nav_peak = *nav;
             }
