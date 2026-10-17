@@ -106,6 +106,12 @@ impl BacktestRunner {
         self
     }
 
+    /// 回测结束 EOD 是否强制市价平仓（透传到 `BacktestEngineConfig.force_liquidate`）
+    pub fn with_force_liquidate(mut self, on: bool) -> Self {
+        self.force_liquidate = on;
+        self
+    }
+
     /// 按 `kind` 构造 Instrument：先复用 `from_symbol` 拆 base/quote，再按需改造成 Swap。
     /// symbol 无 `BASE/QUOTE` 分隔符时 `from_symbol` 退化为默认品种，此处原样返回。
     fn make_instrument(&self, sym: &str) -> Instrument {
@@ -298,11 +304,11 @@ impl BacktestRunner {
         // 5) run() 消费 EventQueue + 聚合 RunResult（队列空时也会 build_result 汇总撮合统计）
         let run_result = engine.run();
 
-        // 终态持仓快照：Instrument → Vec<String>（spot: [kind,base,quote]；swap 再加 settle/size）
-        let final_positions: Vec<(Vec<String>, f64)> = run_result
+        // 终态持仓快照：Instrument → qty（保持 Instrument 原样，Python 端再转元组）
+        let final_positions: Vec<(Instrument, f64)> = run_result
             .positions
             .iter()
-            .map(|(inst, qty)| (instrument_to_vec(inst), *qty))
+            .map(|(inst, qty)| (inst.clone(), *qty))
             .collect();
 
         BacktestResult {
@@ -332,32 +338,6 @@ impl BacktestRunner {
             final_positions,
             n_bars: bars.len() as u64,
             n_strategies: self.strategies.len() as u32,
-        }
-    }
-}
-
-/// Instrument → 字符串元组表示（与 Python 端 `instrument_to_tuple` 对齐）
-///
-/// spot: `["spot", base, quote]`；swap: `["swap", base, quote, settle, contract_size]`
-fn instrument_to_vec(inst: &Instrument) -> Vec<String> {
-    match inst {
-        Instrument::Spot(s) => vec![
-            "spot".to_string(),
-            s.base.as_str().to_string(),
-            s.quote.as_str().to_string(),
-        ],
-        Instrument::Swap(s) => {
-            let settle = match s.settle {
-                axon_core::types::SwapSettle::UsdMargin => "usd_margin",
-                axon_core::types::SwapSettle::CoinMargin => "coin_margin",
-            };
-            vec![
-                "swap".to_string(),
-                s.base.as_str().to_string(),
-                s.quote.as_str().to_string(),
-                settle.to_string(),
-                s.contract_size.to_string(),
-            ]
         }
     }
 }
@@ -431,8 +411,8 @@ pub struct BacktestResult {
     pub fills_detail: Vec<FillRecord>,
     /// 自动 rebalance 触发的下单次数
     pub rebalances_triggered: u64,
-    /// 终态持仓快照（`["spot","BTC","USDT"]` → qty），只保留非零持仓
-    pub final_positions: Vec<(Vec<String>, f64)>,
+    /// 终态持仓快照（`Instrument` → qty），只保留非零持仓
+    pub final_positions: Vec<(Instrument, f64)>,
     /// 回测 bar 数
     pub n_bars: u64,
     /// 策略数

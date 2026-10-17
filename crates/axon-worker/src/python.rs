@@ -83,7 +83,7 @@ pub struct PyBacktestResult {
     /// 每笔 fill 明细（自定义 getter → list[dict]）
     pub fills_detail: Vec<FillRecord>,
     /// 终态持仓（自定义 getter → dict[tuple, float]）
-    pub final_positions: Vec<(Vec<String>, f64)>,
+    pub final_positions: Vec<(Instrument, f64)>,
 }
 
 impl From<&BacktestResult> for PyBacktestResult {
@@ -177,9 +177,8 @@ impl PyBacktestResult {
     #[getter]
     fn final_positions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
-        for (parts, qty) in &self.final_positions {
-            let key = PyTuple::new(py, parts.iter())?;
-            d.set_item(key, *qty)?;
+        for (inst, qty) in &self.final_positions {
+            d.set_item(instrument_to_tuple(py, inst)?, *qty)?;
         }
         Ok(d)
     }
@@ -242,8 +241,8 @@ pub struct PyBacktestRunner {
 #[pymethods]
 impl PyBacktestRunner {
     #[new]
-    #[pyo3(signature = (initial_cash=100000.0, futures=false))]
-    fn new(initial_cash: f64, futures: bool) -> PyResult<Self> {
+    #[pyo3(signature = (initial_cash=100000.0, futures=false, force_liquidate=false))]
+    fn new(initial_cash: f64, futures: bool, force_liquidate: bool) -> PyResult<Self> {
         let runtime = tokio::runtime::Runtime::new().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("创建 tokio runtime 失败: {e}"))
         })?;
@@ -252,6 +251,8 @@ impl PyBacktestRunner {
             // QuantCell futures 口径：USD 保证金 + 合约乘数 1.0
             runner = runner.with_futures(SwapSettle::UsdMargin, 1.0);
         }
+        // 回测结束 EOD 强制平仓
+        runner = runner.with_force_liquidate(force_liquidate);
         Ok(Self {
             inner: Mutex::new(runner),
             runtime,
