@@ -34,6 +34,7 @@ use axon_backtest::L1MatchingEngine;
 use axon_backtest::engine::{BacktestEngine, BacktestEngineConfig, FeeConfig};
 use axon_core::market::bar::Bar;
 use axon_core::portfolio::{FillRecord, TradeRecord};
+use axon_core::types::{SwapInstrument, SwapSettle};
 use axon_core::{EventQueue, Instrument, SimulatedClock, Symbol, Timestamp};
 use axon_strategy::trait_::{BarContext, Strategy, StrategyDecision};
 use serde::Serialize;
@@ -48,6 +49,18 @@ const SEED_HALF_SPREAD: f64 = 0.0005; // 对应 _DEFAULT_HALF_SPREAD_RATIO
 const SEED_DEPTH_LEVELS: usize = 5; // 对应 _DEFAULT_DEPTH_LEVELS
 const SEED_SIZE_PER_LEVEL: f64 = 100.0; // 对应 _DEFAULT_SIZE_PER_LEVEL
 
+/// 回测使用的品种类型（现货 / 永续）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InstrumentKind {
+    /// 现货
+    Spot,
+    /// 永续合约（保证金结算方式 + 合约乘数）
+    Swap {
+        settle: SwapSettle,
+        contract_size: f64,
+    },
+}
+
 /// 回测运行器
 ///
 /// 持有一个 BacktestEngine（L1 撮合 + SimulatedClock + EventQueue），
@@ -56,6 +69,7 @@ pub struct BacktestRunner {
     strategies: Vec<Arc<dyn Strategy>>,
     initial_cash: f64,
     force_liquidate: bool,
+    kind: InstrumentKind,
 }
 
 impl BacktestRunner {
@@ -69,6 +83,7 @@ impl BacktestRunner {
             strategies: Vec::new(),
             initial_cash: _engine_config.initial_cash,
             force_liquidate: _engine_config.force_liquidate,
+            kind: InstrumentKind::Spot,
         }
     }
 
@@ -78,6 +93,37 @@ impl BacktestRunner {
             strategies: Vec::new(),
             initial_cash,
             force_liquidate: false,
+            kind: InstrumentKind::Spot,
+        }
+    }
+
+    /// 切换为永续合约品种（futures 模式，支持资金费结算）
+    pub fn with_futures(mut self, settle: SwapSettle, contract_size: f64) -> Self {
+        self.kind = InstrumentKind::Swap {
+            settle,
+            contract_size,
+        };
+        self
+    }
+
+    /// 按 `kind` 构造 Instrument：先复用 `from_symbol` 拆 base/quote，再按需改造成 Swap。
+    /// symbol 无 `BASE/QUOTE` 分隔符时 `from_symbol` 退化为默认品种，此处原样返回。
+    fn make_instrument(&self, sym: &str) -> Instrument {
+        let parsed = Instrument::from_symbol(&Symbol::from(sym));
+        match (self.kind, parsed) {
+            (
+                InstrumentKind::Swap {
+                    settle,
+                    contract_size,
+                },
+                Instrument::Spot(s),
+            ) => Instrument::Swap(SwapInstrument {
+                base: s.base,
+                quote: s.quote,
+                settle,
+                contract_size,
+            }),
+            (_, other) => other,
         }
     }
 
@@ -94,15 +140,18 @@ impl BacktestRunner {
     ///
     /// # 参数
     /// - `bars`: 时间窗口内所有 K 线（必须按时间升序）
-    /// - `state_by_symbol`: 每个 symbol 预计算好的 state JSON（features + window）
+    /// - `states_by_symbol`: 每个 symbol 的**逐 bar** state 列表（第 i 项对应第 i 根 bar；
+    ///   通常承载 `{"features": {...}}` 等因子/上下文，用于逐 bar 注入）
+    /// - `funding_by_symbol`: 每个 symbol 的资金费查找表 `{bar_纳秒时间戳: (rate, mark_price)}`，
+    ///   命中当前 bar 时刻时入队 `push_funding` 并 drain（对齐 QuantCell BacktestLoop）
     ///
     /// # 返回
     /// BacktestResult：决策轨迹 + RunResult 聚合的撮合统计
     pub async fn run(
         &self,
         bars: &[Bar],
-        state_by_symbol: &BTreeMap<String, serde_json::Value>,
-        _initial_cash: f64,
+        states_by_symbol: &BTreeMap<String, Vec<serde_json::Value>>,
+        funding_by_symbol: &BTreeMap<String, BTreeMap<i64, (f64, f64)>>,
     ) -> BacktestResult {
         assert!(!bars.is_empty(), "bars must not be empty");
 
@@ -120,10 +169,7 @@ impl BacktestRunner {
         // 2) 为每个 symbol 预构造 Instrument（复用，避免每 bar 重复 parse）
         let instruments: BTreeMap<String, Instrument> = unique_symbols
             .iter()
-            .map(|sym| {
-                let inst = Instrument::from_symbol(&Symbol::from(sym.as_str()));
-                (sym.clone(), inst)
-            })
+            .map(|sym| (sym.clone(), self.make_instrument(sym)))
             .collect();
 
         // 3) 构造 BacktestEngine
@@ -168,10 +214,12 @@ impl BacktestRunner {
 
             // 4c) 所有策略 decide + set_target_position（写入的 target 于下一 bar 成交）
             for strategy in &self.strategies {
-                let state = state_by_symbol
+                // 逐 bar state：第 i 根 bar 取列表第 i 项；缺失则 Null（等价无注入）
+                let state: serde_json::Value = states_by_symbol
                     .get(strategy.symbol())
+                    .and_then(|v| v.get(bar_idx))
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or(serde_json::Value::Null);
 
                 let ctx = BarContext {
                     symbol: strategy.symbol(),
@@ -221,6 +269,30 @@ impl BacktestRunner {
             // 这个"有成交则次 bar、无成交则同 bar"的语义是 QuantCell 现有行为，
             // 必须复刻才能保证结果一致。
             engine.rebalance_to_target(None);
+
+            // 4e) 资金费结算：命中当前 bar 时刻的 funding 点时入队 + drain。
+            //     对齐 QuantCell BacktestLoop：push_funding(mark<=0 用 bar.close 兜底)
+            //     后逐个 step() 结算（同 ts 时 fill 先于 funding）。
+            let bar_ts_ns = bar.timestamp.nanos;
+            let mut funding_pushed = false;
+            for sym in &unique_symbols {
+                let Some(sched) = funding_by_symbol.get(sym) else {
+                    continue;
+                };
+                let Some(&(rate, mark)) = sched.get(&bar_ts_ns) else {
+                    continue;
+                };
+                if let Some(inst) = instruments.get(sym) {
+                    let mark_price = if mark > 0.0 { mark } else { bar.close.as_f64() };
+                    engine.push_funding(inst.clone(), rate, mark_price, bar.timestamp);
+                    funding_pushed = true;
+                }
+            }
+            if funding_pushed {
+                while engine.pending_events() > 0 {
+                    engine.step();
+                }
+            }
         }
 
         // 5) run() 消费 EventQueue + 聚合 RunResult（队列空时也会 build_result 汇总撮合统计）
@@ -450,14 +522,15 @@ mod tests {
     async fn backtest_runner_produces_fills_with_rule_strategy() {
         // 1) 构造：bar + state + 策略（RuleStrategyImpl 用 sma5_vs_sma20/ret_1 决策）
         let bars = make_bars();
+        // 逐 bar state：每根 bar 都是同一 features（策略只看当 bar state）
         let mut state_by_symbol = BTreeMap::new();
-        state_by_symbol.insert("BTC/USDT".into(), make_state());
+        state_by_symbol.insert("BTC/USDT".into(), vec![make_state(); bars.len()]);
         let strategy = Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT"));
 
         // 2) 跑 BacktestRunner
         let mut runner = BacktestRunner::simple(100_000.0);
         runner.add_strategy(strategy);
-        let result = runner.run(&bars, &state_by_symbol, 100_000.0).await;
+        let result = runner.run(&bars, &state_by_symbol, &BTreeMap::new()).await;
 
         // 3) 断言：决策轨迹非空 + 撮合引擎有动作（fills/orders_accepted > 0）
         assert_eq!(result.n_bars, 5);
@@ -488,13 +561,16 @@ mod tests {
         let mut state_by_symbol = BTreeMap::new();
         state_by_symbol.insert(
             "BTC/USDT".into(),
-            serde_json::json!({"features": {"sma5_vs_sma20": 0.0, "ret_1": 0.0, "vol_20": 0.01, "volume_z": 0.5}}),
+            vec![
+                serde_json::json!({"features": {"sma5_vs_sma20": 0.0, "ret_1": 0.0, "vol_20": 0.01, "volume_z": 0.5}});
+                bars.len()
+            ],
         );
         let strategy = Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT"));
 
         let mut runner = BacktestRunner::simple(100_000.0);
         runner.add_strategy(strategy);
-        let result = runner.run(&bars, &state_by_symbol, 100_000.0).await;
+        let result = runner.run(&bars, &state_by_symbol, &BTreeMap::new()).await;
 
         // 全 Hold → target 始终 0 → rebalance 无订单 → fills=0, orders_accepted=0
         assert_eq!(result.fills, 0);

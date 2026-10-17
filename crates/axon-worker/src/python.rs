@@ -18,7 +18,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use axon_core::market::bar::Bar;
 use axon_core::portfolio::{FillRecord, TradeRecord};
 use axon_core::time::Timestamp;
-use axon_core::types::{Instrument, Price, Quantity};
+use axon_core::types::{Instrument, Price, Quantity, SwapSettle};
 use axon_strategy::impl_::PythonStrategyImpl;
 use axon_strategy::python::PyRuleStrategyImpl;
 use axon_strategy::trait_::Strategy;
@@ -242,13 +242,18 @@ pub struct PyBacktestRunner {
 #[pymethods]
 impl PyBacktestRunner {
     #[new]
-    #[pyo3(signature = (initial_cash=100000.0))]
-    fn new(initial_cash: f64) -> PyResult<Self> {
+    #[pyo3(signature = (initial_cash=100000.0, futures=false))]
+    fn new(initial_cash: f64, futures: bool) -> PyResult<Self> {
         let runtime = tokio::runtime::Runtime::new().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("创建 tokio runtime 失败: {e}"))
         })?;
+        let mut runner = BacktestRunner::simple(initial_cash);
+        if futures {
+            // QuantCell futures 口径：USD 保证金 + 合约乘数 1.0
+            runner = runner.with_futures(SwapSettle::UsdMargin, 1.0);
+        }
         Ok(Self {
-            inner: Mutex::new(BacktestRunner::simple(initial_cash)),
+            inner: Mutex::new(runner),
             runtime,
         })
     }
@@ -303,12 +308,16 @@ impl PyBacktestRunner {
     /// 执行回测（同步阻塞，内部 block_on async 循环）
     ///
     /// - `bars`: list[dict]，每个 dict 含 timestamp(ns int)/open/high/low/close/volume
-    /// - `state_by_symbol`: dict[str, dict]，预计算的 state（当前 RuleStrategyImpl 不需要，传 {} 即可）
-    #[pyo3(signature = (bars, state_by_symbol=None))]
+    /// - `states_by_symbol`: dict[str, dict | list[dict]]；值为 list 时按**逐 bar** 注入
+    ///   （第 i 项对应第 i 根 bar），值为单对象时展开为「每 bar 同值」的便捷用法
+    /// - `funding_by_symbol`: dict[str, dict[int, tuple(rate, mark_price)]]，资金费查找表
+    ///   （键为 bar 纳秒时间戳；命中即入队结算）。现货回测传 None 即可
+    #[pyo3(signature = (bars, states_by_symbol=None, funding_by_symbol=None))]
     fn run(
         &self,
         bars: Vec<Bound<'_, PyDict>>,
-        state_by_symbol: Option<Bound<'_, PyDict>>,
+        states_by_symbol: Option<Bound<'_, PyDict>>,
+        funding_by_symbol: Option<Bound<'_, PyDict>>,
     ) -> PyResult<PyBacktestResult> {
         if bars.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err("bars 不能为空"));
@@ -320,32 +329,65 @@ impl PyBacktestRunner {
             .map(|d| dict_to_bar(d))
             .collect::<PyResult<Vec<_>>>()?;
 
-        // 2) state_by_symbol → BTreeMap<String, serde_json::Value>
-        //    Python dict 用 json.dumps 序列化（str() 是单引号，不是合法 JSON）
-        let states: BTreeMap<String, serde_json::Value> = match state_by_symbol {
+        let py = bars[0].py();
+        let json_mod = py.import("json")?;
+
+        // 2) states_by_symbol → BTreeMap<String, Vec<Value>>（每 bar 一项）
+        let states: BTreeMap<String, Vec<serde_json::Value>> = match states_by_symbol {
             Some(d) => {
-                let py = d.py();
-                let json_mod = py.import("json")?;
                 let mut m = BTreeMap::new();
                 for (k, v) in d.iter() {
                     let key: String = k.extract()?;
-                    let json_str: String = json_mod.call_method1("dumps", (v,))?.extract()?;
-                    let val = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
-                    m.insert(key, val);
+                    let list = if v.is_instance_of::<PyList>() {
+                        let items: Vec<Bound<'_, PyAny>> = v.extract()?;
+                        items
+                            .iter()
+                            .map(|it| dict_to_json_value(&json_mod, it))
+                            .collect::<PyResult<Vec<_>>>()?
+                    } else {
+                        // 单对象 → 每 bar 同值
+                        vec![dict_to_json_value(&json_mod, &v)?; rust_bars.len()]
+                    };
+                    m.insert(key, list);
                 }
                 m
             }
             None => BTreeMap::new(),
         };
 
-        // 3) block_on 执行 async 回测
+        // 3) funding_by_symbol → BTreeMap<String, BTreeMap<i64, (f64, f64)>>
+        let funding: BTreeMap<String, BTreeMap<i64, (f64, f64)>> = match funding_by_symbol {
+            Some(d) => {
+                let mut m = BTreeMap::new();
+                for (k, v) in d.iter() {
+                    let key: String = k.extract()?;
+                    let sched: BTreeMap<i64, (f64, f64)> = v.extract()?;
+                    m.insert(key, sched);
+                }
+                m
+            }
+            None => BTreeMap::new(),
+        };
+
+        // 4) block_on 执行 async 回测
         let runner = self.inner.lock().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("BacktestRunner lock 失败: {e}"))
         })?;
-        let result = self.runtime.block_on(runner.run(&rust_bars, &states, 0.0));
+        let result = self
+            .runtime
+            .block_on(runner.run(&rust_bars, &states, &funding));
 
         Ok((&result).into())
     }
+}
+
+/// Python 对象 → serde_json::Value（经 json.dumps，避免 str() 的单引号问题）
+fn dict_to_json_value(
+    json_mod: &Bound<'_, PyAny>,
+    v: &Bound<'_, PyAny>,
+) -> PyResult<serde_json::Value> {
+    let json_str: String = json_mod.call_method1("dumps", (v,))?.extract()?;
+    Ok(serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null))
 }
 
 /// 从 Python dict 构造 Bar

@@ -338,6 +338,20 @@ impl Strategy for PythonStrategyImpl {
                 .bar_to_py_dict(py, ctx.bar)
                 .map_err(|e| StrategyError::Logic(format!("bar→dict 失败: {e}")))?;
 
+            // 逐 bar state（因子/上下文）注入：非 Null 时以 `bar["state"]` 传给 Python 策略，
+            // 供适配层映射到 StrategyContext.features 等。
+            if !ctx.state.is_null() {
+                let state_str = serde_json::to_string(ctx.state)
+                    .map_err(|e| StrategyError::Logic(format!("state 序列化失败: {e}")))?;
+                let state_py = py
+                    .import("json")
+                    .and_then(|m| m.call_method1("loads", (state_str,)))
+                    .map_err(|e| StrategyError::Logic(format!("state→dict 失败: {e}")))?;
+                bar_dict
+                    .set_item("state", state_py)
+                    .map_err(|e| StrategyError::Logic(format!("state 注入 bar 失败: {e}")))?;
+            }
+
             // 优先 decide，回退 on_bar
             let bound = self.py_obj.bind(py);
             let method = bound
