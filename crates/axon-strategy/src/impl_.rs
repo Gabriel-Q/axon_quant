@@ -333,7 +333,7 @@ impl Strategy for PythonStrategyImpl {
 
     async fn decide(&self, ctx: &BarContext<'_>) -> Result<StrategyDecision, StrategyError> {
         // 获取 GIL，同步调用 Python 策略方法（回测是 block_on，无并发 GIL 争用）
-        let result = Python::attach(|py| -> Result<StrategyDecision, StrategyError> {
+        Python::attach(|py| -> Result<StrategyDecision, StrategyError> {
             let bar_dict = self
                 .bar_to_py_dict(py, ctx.bar)
                 .map_err(|e| StrategyError::Logic(format!("bar→dict 失败: {e}")))?;
@@ -376,9 +376,7 @@ impl Strategy for PythonStrategyImpl {
             Ok(StrategyDecision::from_rule(action)
                 .with_confidence(confidence)
                 .with_target_position(target))
-        });
-
-        result
+        })
     }
 }
 

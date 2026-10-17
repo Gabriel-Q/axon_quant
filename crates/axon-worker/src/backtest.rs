@@ -33,6 +33,7 @@ use std::sync::Arc;
 use axon_backtest::L1MatchingEngine;
 use axon_backtest::engine::{BacktestEngine, BacktestEngineConfig, FeeConfig};
 use axon_core::market::bar::Bar;
+use axon_core::portfolio::{FillRecord, TradeRecord};
 use axon_core::{EventQueue, Instrument, SimulatedClock, Symbol, Timestamp};
 use axon_strategy::trait_::{BarContext, Strategy, StrategyDecision};
 use serde::Serialize;
@@ -202,18 +203,66 @@ impl BacktestRunner {
         // 5) run() 消费 EventQueue + 聚合 RunResult（队列空时也会 build_result 汇总撮合统计）
         let run_result = engine.run();
 
+        // 终态持仓快照：Instrument → Vec<String>（spot: [kind,base,quote]；swap 再加 settle/size）
+        let final_positions: Vec<(Vec<String>, f64)> = run_result
+            .positions
+            .iter()
+            .map(|(inst, qty)| (instrument_to_vec(inst), *qty))
+            .collect();
+
         BacktestResult {
             events_processed: run_result.events_processed,
             orders_accepted: run_result.orders_accepted,
             orders_rejected: run_result.orders_rejected,
+            orders_cancelled: run_result.orders_cancelled,
+            orders_modified: run_result.orders_modified,
             fills: run_result.fills,
             total_pnl: run_result.total_pnl,
             max_drawdown: run_result.max_drawdown,
+            max_drawdown_pct: run_result.max_drawdown_pct,
+            nav_peak: run_result.nav_peak,
             final_nav: run_result.final_nav,
+            total_fees: run_result.total_fees,
+            total_funding_pnl: run_result.total_funding_pnl,
+            win_rate: run_result.win_rate,
+            sharpe_ratio: run_result.sharpe_ratio,
+            duration_secs: run_result.duration.as_secs_f64(),
+            final_time_ns: run_result.final_time.nanos,
             decisions_timeline,
             bar_nav_curve: run_result.bar_nav_curve,
+            equity_curve: run_result.equity_curve,
+            trades: run_result.trades,
+            fills_detail: run_result.fills_detail,
+            rebalances_triggered: run_result.rebalances_triggered,
+            final_positions,
             n_bars: bars.len() as u64,
             n_strategies: self.strategies.len() as u32,
+        }
+    }
+}
+
+/// Instrument → 字符串元组表示（与 Python 端 `instrument_to_tuple` 对齐）
+///
+/// spot: `["spot", base, quote]`；swap: `["swap", base, quote, settle, contract_size]`
+fn instrument_to_vec(inst: &Instrument) -> Vec<String> {
+    match inst {
+        Instrument::Spot(s) => vec![
+            "spot".to_string(),
+            s.base.as_str().to_string(),
+            s.quote.as_str().to_string(),
+        ],
+        Instrument::Swap(s) => {
+            let settle = match s.settle {
+                axon_core::types::SwapSettle::UsdMargin => "usd_margin",
+                axon_core::types::SwapSettle::CoinMargin => "coin_margin",
+            };
+            vec![
+                "swap".to_string(),
+                s.base.as_str().to_string(),
+                s.quote.as_str().to_string(),
+                settle.to_string(),
+                s.contract_size.to_string(),
+            ]
         }
     }
 }
@@ -236,6 +285,9 @@ fn action_to_target(act: axon_llm::decision::Action) -> f64 {
 // ── 结果类型 ── //
 
 /// BacktestRunner 最终输出（扩展自 Phase 1，加入 RunResult 撮合统计）
+///
+/// 字段与 `axon_backtest::RunResult` 对齐（QuantCell 结果契约依赖这些字段），
+/// 平铺存储以避免 `HashMap<Instrument, _>` 的 serde map-key 问题。
 #[derive(Debug, Clone, Serialize)]
 pub struct BacktestResult {
     /// 已处理事件总数（RunResult 聚合）
@@ -244,18 +296,48 @@ pub struct BacktestResult {
     pub orders_accepted: u64,
     /// 拒绝的订单数
     pub orders_rejected: u64,
+    /// 取消的订单数
+    pub orders_cancelled: u64,
+    /// 修改的订单数
+    pub orders_modified: u64,
     /// 成交（fill）总数
     pub fills: u64,
     /// 最终 PnL（final_nav - initial_cash）
     pub total_pnl: f64,
     /// 最大回撤（USD）
     pub max_drawdown: f64,
+    /// 最大回撤比例（0~1 小数形式）
+    pub max_drawdown_pct: f64,
+    /// NAV 历史峰值
+    pub nav_peak: f64,
     /// 最终净资产
     pub final_nav: f64,
+    /// 累计手续费
+    pub total_fees: f64,
+    /// 累计资金费结算 PnL
+    pub total_funding_pnl: f64,
+    /// 胜率（0~1 小数形式）
+    pub win_rate: f64,
+    /// 夏普比率
+    pub sharpe_ratio: f64,
+    /// 运行耗时（秒）
+    pub duration_secs: f64,
+    /// 引擎最终时间（纳秒）
+    pub final_time_ns: i64,
     /// 每 bar 所有策略的决策轨迹
     pub decisions_timeline: Vec<BarDecisionRecord>,
     /// 每 bar 末 mark-to-market NAV 曲线（L1/L2 指标用这个）
     pub bar_nav_curve: Vec<(Timestamp, f64)>,
+    /// 稀疏 NAV 曲线（fill/funding 事件触发时采样）
+    pub equity_curve: Vec<(Timestamp, f64)>,
+    /// round-trip 配对交易记录
+    pub trades: Vec<TradeRecord>,
+    /// 每笔 fill 明细
+    pub fills_detail: Vec<FillRecord>,
+    /// 自动 rebalance 触发的下单次数
+    pub rebalances_triggered: u64,
+    /// 终态持仓快照（`["spot","BTC","USDT"]` → qty），只保留非零持仓
+    pub final_positions: Vec<(Vec<String>, f64)>,
     /// 回测 bar 数
     pub n_bars: u64,
     /// 策略数
