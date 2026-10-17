@@ -133,6 +133,9 @@ impl BacktestRunner {
         );
         // 启用自动 rebalance（begin_bar_multi 末尾会触发）
         engine.with_auto_rebalance(REBALANCE_THRESHOLD);
+        // 启用虚拟对手盘（L1 撮合引擎默认空 book，没有对手盘 rebalance 发出去没人接）
+        // seed 参数：half_spread 是**绝对价格**（不是 bps），depth_levels=5 层，每层 1000 单位
+        engine.with_seed_liquidity(0.001, 5, 1000.0);
 
         // 4) 逐 bar 编排
         let mut decisions_timeline: Vec<BarDecisionRecord> =
@@ -288,4 +291,106 @@ fn parse_base_symbol(market: &str) -> String {
         }
     }
     upper
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 集成测试：BacktestRunner → BacktestEngine 全链路
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axon_core::market::bar::Bar;
+    use axon_core::time::Timestamp;
+    use axon_core::types::{Price, Quantity};
+    use axon_strategy::impl_::RuleStrategyImpl;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// 构造 5 根上涨趋势 Bar（BTC/USDT，1min 间隔，price 100→105）
+    fn make_bars() -> Vec<Bar> {
+        (0..5)
+            .map(|i| {
+                let ts = Timestamp::from_secs(i * 60);
+                let close_f = 100.0 + i as f64;
+                Bar {
+                    timestamp: ts,
+                    open: Price::from_f64(close_f - 0.5),
+                    high: Price::from_f64(close_f + 0.3),
+                    low: Price::from_f64(close_f - 0.8),
+                    close: Price::from_f64(close_f),
+                    volume: Quantity::from_f64(1000.0),
+                }
+            })
+            .collect()
+    }
+
+    /// 构造触发 RuleStrategyImpl → Buy 的 state
+    fn make_state() -> serde_json::Value {
+        serde_json::json!({
+            "features": {
+                "sma5_vs_sma20": 0.02,   // 均线向上分叉
+                "ret_1": 0.01,           // 近一根正收益
+                "vol_20": 0.01,
+                "volume_z": 0.5,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn backtest_runner_produces_fills_with_rule_strategy() {
+        // 1) 构造：bar + state + 策略（RuleStrategyImpl 用 sma5_vs_sma20/ret_1 决策）
+        let bars = make_bars();
+        let mut state_by_symbol = BTreeMap::new();
+        state_by_symbol.insert("BTC/USDT".into(), make_state());
+        let strategy = Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT"));
+
+        // 2) 跑 BacktestRunner
+        let mut runner = BacktestRunner::simple(100_000.0);
+        runner.add_strategy(strategy);
+        let result = runner.run(&bars, &state_by_symbol, 100_000.0).await;
+
+        // 3) 断言：决策轨迹非空 + 撮合引擎有动作（fills/orders_accepted > 0）
+        assert_eq!(result.n_bars, 5);
+        assert_eq!(result.n_strategies, 1);
+        assert_eq!(result.decisions_timeline.len(), 5);
+        // 每根 bar 都产生一个 Buy target → 自动 rebalance → 至少一次 fill
+        assert!(
+            result.fills > 0 || result.orders_accepted > 0,
+            "expected fills or orders_accepted, got fills={} accepted={} rejected={}",
+            result.fills,
+            result.orders_accepted,
+            result.orders_rejected
+        );
+        // final_nav 至少等于 initial_cash（5 根 bar 全 Buy，price 上涨应该赚）
+        assert!(
+            result.final_nav >= 100_000.0 - 0.01, // 0.01 容忍浮点
+            "final_nav {} < initial_cash 100000",
+            result.final_nav
+        );
+        // bar_nav_curve 有 5 帧（begin_bar_multi 每 bar 末采样一帧）
+        assert_eq!(result.bar_nav_curve.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn backtest_runner_hold_produces_no_fill() {
+        // state 设 sma5_vs_sma20=0, ret_1=0 → RuleStrategyImpl 返回 Hold → target=0.0 → rebalance no-op
+        let bars = make_bars();
+        let mut state_by_symbol = BTreeMap::new();
+        state_by_symbol.insert(
+            "BTC/USDT".into(),
+            serde_json::json!({"features": {"sma5_vs_sma20": 0.0, "ret_1": 0.0, "vol_20": 0.01, "volume_z": 0.5}}),
+        );
+        let strategy = Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT"));
+
+        let mut runner = BacktestRunner::simple(100_000.0);
+        runner.add_strategy(strategy);
+        let result = runner.run(&bars, &state_by_symbol, 100_000.0).await;
+
+        // 全 Hold → target 始终 0 → rebalance 无订单 → fills=0, orders_accepted=0
+        assert_eq!(result.fills, 0);
+        assert_eq!(result.orders_accepted, 0);
+        assert_eq!(result.orders_rejected, 0);
+        assert_eq!(result.final_nav, 100_000.0);
+    }
 }
