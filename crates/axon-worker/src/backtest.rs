@@ -38,8 +38,15 @@ use axon_core::{EventQueue, Instrument, SimulatedClock, Symbol, Timestamp};
 use axon_strategy::trait_::{BarContext, Strategy, StrategyDecision};
 use serde::Serialize;
 
-/// 撮合自动 rebalance 阈值（避免目标无意义抖动也触发撮合）
-const REBALANCE_THRESHOLD: f64 = 1e-6;
+// 撮合种子流动性 + 自动 rebalance 参数。
+//
+// ponytail: 这几个值硬编码对齐 QuantCell `backtest_loop.py` 的 `_DEFAULT_*`
+// 常量，使 Rust 编排路径与现有 Python 编排路径撮合口径一致（parity）。
+// 上限：跨项目耦合，多消费者或需调参时改走 `BacktestRunnerConfig` 下发。
+const REBALANCE_THRESHOLD: f64 = 0.001; // 对应 _DEFAULT_AUTO_REBALANCE_THRESHOLD
+const SEED_HALF_SPREAD: f64 = 0.0005; // 对应 _DEFAULT_HALF_SPREAD_RATIO
+const SEED_DEPTH_LEVELS: usize = 5; // 对应 _DEFAULT_DEPTH_LEVELS
+const SEED_SIZE_PER_LEVEL: f64 = 100.0; // 对应 _DEFAULT_SIZE_PER_LEVEL
 
 /// 回测运行器
 ///
@@ -135,8 +142,8 @@ impl BacktestRunner {
         // 启用自动 rebalance（begin_bar_multi 末尾会触发）
         engine.with_auto_rebalance(REBALANCE_THRESHOLD);
         // 启用虚拟对手盘（L1 撮合引擎默认空 book，没有对手盘 rebalance 发出去没人接）
-        // seed 参数：half_spread 是**绝对价格**（不是 bps），depth_levels=5 层，每层 1000 单位
-        engine.with_seed_liquidity(0.001, 5, 1000.0);
+        // seed 参数：half_spread 是**绝对价格**（不是 bps），depth_levels 层，每层 size 单位
+        engine.with_seed_liquidity(SEED_HALF_SPREAD, SEED_DEPTH_LEVELS, SEED_SIZE_PER_LEVEL);
 
         // 4) 逐 bar 编排
         let mut decisions_timeline: Vec<BarDecisionRecord> =
@@ -146,7 +153,20 @@ impl BacktestRunner {
             // 4a) 时钟推进到当前 bar（BacktestEngine.config 私有，走公开 setter）
             engine.set_clock(bar.timestamp);
 
-            // 4b) 所有策略先 decide + set_target_position
+            // 4b) 先推进 bar：begin_bar_multi → seed_liquidity + 自动 rebalance_to_target。
+            //
+            // 顺序对齐 QuantCell 的 BacktestLoop：每 bar 先 `begin_bar` 再让策略决策，
+            // 因此本 bar 的 rebalance 执行的是**上一 bar**设定的 target
+            // （信号在 bar 末产生、次 bar 成交，避免前视偏差）。若把决策放在 begin_bar
+            // 之前，target 会同 bar 生效，结果与 QuantCell 现有路径不一致。
+            // bar.close 作为 mid_price（L1 撮合引擎的 mark）。
+            let legs: Vec<(Instrument, f64)> = instruments
+                .values()
+                .map(|inst| (inst.clone(), bar.close.as_f64()))
+                .collect();
+            engine.begin_bar_multi(legs);
+
+            // 4c) 所有策略 decide + set_target_position（写入的 target 于下一 bar 成交）
             for strategy in &self.strategies {
                 let state = state_by_symbol
                     .get(strategy.symbol())
@@ -179,7 +199,7 @@ impl BacktestRunner {
                     bar_close: bar.close.as_f64(),
                 });
 
-                // 仅 Ok 时 set_target_position（引擎用它撮合）
+                // 仅 Ok 时 set_target_position（引擎下一次 rebalance 用它撮合）
                 if let Ok(ref dec) = decision {
                     // 优先用策略指定的 target_position，否则按 action 推导
                     let target = dec
@@ -191,13 +211,16 @@ impl BacktestRunner {
                 }
             }
 
-            // 4c) begin_bar_multi → seed_liquidity + 自动 rebalance_to_target
-            // bar.close 作为 mid_price（L1 撮合引擎的 mark）
-            let legs: Vec<(Instrument, f64)> = instruments
-                .values()
-                .map(|inst| (inst.clone(), bar.close.as_f64()))
-                .collect();
-            engine.begin_bar_multi(legs);
+            // 4d) 显式 rebalance：对齐 QuantCell BacktestLoop 在 set_target_position
+            //     后的 `engine.rebalance_to_target()` 调用。
+            //
+            // 关键：`rebalance_to_target` 的 bar_id guard **仅在有成交时**才置位
+            // （见 engine.rs `if triggered > 0 { last_rebalance_bar_id = bar_id }`）。
+            // 故 4b 的自动 rebalance 若无成交，本步不会被打断，会用**本 bar 刚写入的
+            // target** 立即调仓（同 bar 生效）；若有成交，本步被 guard 跳过（次 bar 生效）。
+            // 这个"有成交则次 bar、无成交则同 bar"的语义是 QuantCell 现有行为，
+            // 必须复刻才能保证结果一致。
+            engine.rebalance_to_target(None);
         }
 
         // 5) run() 消费 EventQueue + 聚合 RunResult（队列空时也会 build_result 汇总撮合统计）
