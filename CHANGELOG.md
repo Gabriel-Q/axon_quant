@@ -17,13 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `SwarmRouteStrategyImpl`：快慢决策路由（低置信升级到慢路径）
     - `PythonStrategyImpl`：桥接 Python 的 `decide(bar)` / `on_bar(bar)` 到 Rust `Strategy`
   - `axon-worker`：`BacktestRunner` 全 Rust 原生回测编排（逐 bar `decide` → `target_position` → `BacktestEngine` 真撮合）+ `StrategyManager` 单例注册表
+    - 期货品种（`with_futures`）+ 逐 bar 资金费结算（`funding_by_symbol`，命中 bar 时刻即 `push_funding` + drain）
+    - 逐 bar 状态注入：`states_by_symbol` 为列表时 `BarContext.state` 取第 i 项，`PythonStrategyImpl` 以 `bar["state"]` 透传给 Python 策略
 - `StrategyDecision` 新增 `target_position` 字段与 `with_confidence` / `with_target_position` builder；`BarContext` 新增 `bar` 字段
 - `axon-llm` decision：`Question::blank(kind)` 测试 helper
 
 ### Python 绑定
 
 - `axon_quant.strategy`：`RuleStrategyImpl`、`BacktestRunnerConfig`
-- `axon_quant.worker`：`BacktestRunner`（`add_strategy` / `run`）、`BacktestResult`
+- `axon_quant.worker`：`BacktestRunner(initial_cash, futures=False)`（`add_strategy` / `run`）、`BacktestResult`
+  - `run(bars, states_by_symbol=None, funding_by_symbol=None)`：states 值为 list 时逐 bar 注入，为单对象时展开为「每 bar 同值」
   - `BacktestResult` 字段与 `RunResult` 对齐：`trades` / `fills_detail` / `equity_curve` / `bar_nav_curve` / `nav_peak` / `max_drawdown_pct` / `win_rate` / `sharpe_ratio` / `total_fees` / `final_positions` 等
 - 自定义 Python 策略无需基类，实现 `decide(bar)` / `on_bar(bar)` 即可注册到 `BacktestRunner`
 

@@ -1002,10 +1002,17 @@ print(d["action"], d["source"], d["confidence"])
 
 | 类 / 方法 | 说明 |
 |-----------|------|
-| `BacktestRunner(initial_cash=100000.0)` | 回测编排器(内部独占 tokio runtime) |
+| `BacktestRunner(initial_cash=100000.0, futures=False)` | 回测编排器(内部独占 tokio runtime)。`futures=True` 用永续合约品种(USD 保证金 / 乘数 1.0)，支持资金费结算 |
 | `runner.add_strategy(strategy, name=None, symbol=None)` | 注册策略:支持 `strategy.RuleStrategyImpl` 实例,或任意实现 `decide(bar)` / `on_bar(bar)` 的 Python 对象 |
-| `runner.run(bars, state_by_symbol=None)` | 同步执行回测,返回 `BacktestResult` |
+| `runner.run(bars, states_by_symbol=None, funding_by_symbol=None)` | 同步执行回测,返回 `BacktestResult` |
 | `BacktestResult` | 回测结果 DTO(只由 `run()` 返回,不可直接实例化) |
+
+`run()` 参数:
+
+| 参数 | 说明 |
+|------|------|
+| `states_by_symbol` | `dict[str, dict \| list[dict]]`:值为 **list** 时按**逐 bar** 注入(第 i 项对应第 i 根 bar);值为单对象时展开为「每 bar 同值」。Rust 侧会以 `bar["state"]` 透传给 Python 策略 |
+| `funding_by_symbol` | `dict[str, dict[int, tuple(rate, mark_price)]]`:资金费查找表,键为 bar 纳秒时间戳,命中即入队结算(现货传 `None`) |
 
 `BacktestResult` 字段(与 `RunResult` 对齐):
 
@@ -1039,7 +1046,7 @@ runner = worker.BacktestRunner(initial_cash=100_000.0)
 runner.add_strategy(strategy.RuleStrategyImpl("dual_ma", "BTC/USDT"))
 result = runner.run(
     bars=bars,
-    state_by_symbol={"BTC/USDT": {"features": {"sma5_vs_sma20": 0.02, "ret_1": 0.01}}},
+    states_by_symbol={"BTC/USDT": {"features": {"sma5_vs_sma20": 0.02, "ret_1": 0.01}}},
 )
 print(result.fills, result.final_nav, result.total_pnl)
 

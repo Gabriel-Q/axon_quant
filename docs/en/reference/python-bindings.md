@@ -117,10 +117,17 @@ Python bindings of `axon-worker`: per-bar strategy orchestration into `BacktestE
 
 | Class / method | Description |
 |----------------|-------------|
-| `BacktestRunner(initial_cash=100000.0)` | Backtest orchestrator (owns a dedicated tokio runtime) |
+| `BacktestRunner(initial_cash=100000.0, futures=False)` | Backtest orchestrator (owns a dedicated tokio runtime). `futures=True` uses a perpetual-swap instrument (USD margin / contract size 1.0) and enables funding settlement |
 | `runner.add_strategy(strategy, name=None, symbol=None)` | Register a strategy: a `strategy.RuleStrategyImpl` instance, or any Python object implementing `decide(bar)` / `on_bar(bar)` |
-| `runner.run(bars, state_by_symbol=None)` | Run the backtest synchronously, returns `BacktestResult` |
+| `runner.run(bars, states_by_symbol=None, funding_by_symbol=None)` | Run the backtest synchronously, returns `BacktestResult` |
 | `BacktestResult` | Result DTO (returned by `run()` only; not directly instantiable) |
+
+`run()` parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `states_by_symbol` | `dict[str, dict \| list[dict]]`: a **list** is injected **per bar** (item i for bar i); a single object expands to "same value every bar". Rust passes it through to Python strategies as `bar["state"]` |
+| `funding_by_symbol` | `dict[str, dict[int, tuple(rate, mark_price)]]`: funding lookup keyed by bar nanosecond timestamp; a hit enqueues settlement (pass `None` for spot) |
 
 `BacktestResult` fields (aligned with `RunResult`):
 
@@ -154,7 +161,7 @@ runner = worker.BacktestRunner(initial_cash=100_000.0)
 runner.add_strategy(strategy.RuleStrategyImpl("dual_ma", "BTC/USDT"))
 result = runner.run(
     bars=bars,
-    state_by_symbol={"BTC/USDT": {"features": {"sma5_vs_sma20": 0.02, "ret_1": 0.01}}},
+    states_by_symbol={"BTC/USDT": {"features": {"sma5_vs_sma20": 0.02, "ret_1": 0.01}}},
 )
 print(result.fills, result.final_nav, result.total_pnl)
 
