@@ -100,6 +100,71 @@ print(d["action"], d["source"], d["confidence"])
 
 > The real HTTP backend requires the `decision-http` feature; `with_llm_fallback` can escalate low-confidence decisions to an `LLMBackend` for review.
 
+### axon_quant.strategy (new in `0.18.0`) — Unified Strategy Layer
+
+Python bindings of `axon-strategy`, unifying strategies behind a `decide(bar) -> dict` protocol shared by backtest and live trading.
+
+| Class | Description |
+|-------|-------------|
+| `RuleStrategyImpl(name, symbol)` | Built-in dual-MA rule strategy (reads `sma5_vs_sma20` / `ret_1` from `state["features"]`) |
+| `BacktestRunnerConfig(initial_cash=100000.0, harness_mode=None)` | Backtest config DTO |
+
+Custom Python strategies **need no base class**: just implement `decide(bar_dict)` or `on_bar(bar_dict)` returning a dict (or object) with `action_type` (`"buy"` / `"sell"` / `"hold"`) / `confidence` / `target_position`, then register it on a `BacktestRunner`.
+
+### axon_quant.worker (new in `0.18.0`) — All-Rust Backtest Orchestration
+
+Python bindings of `axon-worker`: per-bar strategy orchestration into `BacktestEngine` real matching, producing a result contract aligned with `axon_quant.backtest.RunResult`.
+
+| Class / method | Description |
+|----------------|-------------|
+| `BacktestRunner(initial_cash=100000.0)` | Backtest orchestrator (owns a dedicated tokio runtime) |
+| `runner.add_strategy(strategy, name=None, symbol=None)` | Register a strategy: a `strategy.RuleStrategyImpl` instance, or any Python object implementing `decide(bar)` / `on_bar(bar)` |
+| `runner.run(bars, state_by_symbol=None)` | Run the backtest synchronously, returns `BacktestResult` |
+| `BacktestResult` | Result DTO (returned by `run()` only; not directly instantiable) |
+
+`BacktestResult` fields (aligned with `RunResult`):
+
+| Field | Description |
+|-------|-------------|
+| `fills` / `orders_accepted` / `orders_rejected` / `orders_cancelled` / `orders_modified` | Matching statistics |
+| `total_pnl` / `final_nav` / `nav_peak` | PnL / NAV |
+| `max_drawdown` / `max_drawdown_pct` | Max drawdown (USD / fractional ratio) |
+| `win_rate` / `sharpe_ratio` / `total_fees` / `total_funding_pnl` | Performance metrics |
+| `trades` | Round-trip trade records, `list[dict]` |
+| `fills_detail` | Per-fill detail, `list[dict]` |
+| `equity_curve` / `bar_nav_curve` | NAV curves, `[(timestamp_ns, nav), ...]` |
+| `final_positions` | Final positions, `dict[tuple, float]` |
+| `duration_secs` / `final_time_ns` / `n_bars` / `n_strategies` / `rebalances_triggered` | Metadata |
+
+#### Example: All-Rust backtest
+
+```python
+from axon_quant import strategy, worker
+
+# 1) Build bars (timestamp in nanoseconds)
+bars = [
+    {"timestamp": 1_700_000_000_000_000_000 + i * 3_600_000_000_000,
+     "open": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i,
+     "close": 100.5 + i, "volume": 1000.0}
+    for i in range(5)
+]
+
+# 2) Register a built-in Rust strategy
+runner = worker.BacktestRunner(initial_cash=100_000.0)
+runner.add_strategy(strategy.RuleStrategyImpl("dual_ma", "BTC/USDT"))
+result = runner.run(
+    bars=bars,
+    state_by_symbol={"BTC/USDT": {"features": {"sma5_vs_sma20": 0.02, "ret_1": 0.01}}},
+)
+print(result.fills, result.final_nav, result.total_pnl)
+
+# 3) Or register any Python strategy (implement decide(bar) or on_bar(bar))
+runner.add_strategy(MyPythonStrategy(), name="my_py", symbol="BTC/USDT")
+result = runner.run(bars=bars)
+```
+
+> `symbol` must be in `BASE/QUOTE` form (Rust `Instrument::from_symbol` splits on `/`); a separator-less symbol (e.g. `"BTCUSDT"`) degrades to an empty base/quote.
+
 ### axon_quant.hpo — Hyperparameter Optimization
 
 ```python

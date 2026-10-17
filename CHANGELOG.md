@@ -6,6 +6,31 @@ All notable changes to AXON will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-10-17
+
+### Added
+
+- **策略编排内核**：新增 `axon-strategy` 与 `axon-worker` 两个 crate，把「逐 bar 决策 → 撮合」的编排从调用方下沉到引擎侧
+  - `axon-strategy`：统一 `Strategy` trait（`decide(&BarContext) -> StrategyDecision`），策略不感知自己运行在回测还是实盘；内置实现
+    - `SdmStrategyImpl`：SDM 快路径 + Cascade 门控 + 可选 `HarnessBridge` 治理裁决
+    - `RuleStrategyImpl`：双均线规则策略
+    - `SwarmRouteStrategyImpl`：快慢决策路由（低置信升级到慢路径）
+    - `PythonStrategyImpl`：桥接 Python 的 `decide(bar)` / `on_bar(bar)` 到 Rust `Strategy`
+  - `axon-worker`：`BacktestRunner` 全 Rust 原生回测编排（逐 bar `decide` → `target_position` → `BacktestEngine` 真撮合）+ `StrategyManager` 单例注册表
+- `StrategyDecision` 新增 `target_position` 字段与 `with_confidence` / `with_target_position` builder；`BarContext` 新增 `bar` 字段
+- `axon-llm` decision：`Question::blank(kind)` 测试 helper
+
+### Python 绑定
+
+- `axon_quant.strategy`：`RuleStrategyImpl`、`BacktestRunnerConfig`
+- `axon_quant.worker`：`BacktestRunner`（`add_strategy` / `run`）、`BacktestResult`
+  - `BacktestResult` 字段与 `RunResult` 对齐：`trades` / `fills_detail` / `equity_curve` / `bar_nav_curve` / `nav_peak` / `max_drawdown_pct` / `win_rate` / `sharpe_ratio` / `total_fees` / `final_positions` 等
+- 自定义 Python 策略无需基类，实现 `decide(bar)` / `on_bar(bar)` 即可注册到 `BacktestRunner`
+
+### Fixed
+
+- **`BacktestRunner` 结果与 `BacktestLoop` 不一致**：逐 bar 顺序（`begin_bar` 提前到策略决策之前 + 决策后补显式 `rebalance_to_target`，复刻「有成交则次 bar、无成交则同 bar」的条件语义）与 seed 流动性常量（`half_spread` / `size_per_level` / `auto_rebalance`）对齐 QuantCell `BacktestLoop` 后，同一策略 + 数据下两条路径结果 **bit-identical**。
+
 ## [0.16.1] - 2026-10-14
 
 ### Fixed
