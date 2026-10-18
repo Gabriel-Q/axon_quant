@@ -28,11 +28,19 @@ git checkout -b 0.17.1
 ```bash
 cargo fmt --all                              # pre-commit 自动跑
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --features python --locked -- -D warnings
+                                             # = make python-lint，见下
 cargo test  --workspace --locked             # 跑过再提交,避免 CI 才炸
 ```
 
 **铁律**：CI 挂了再修的成本远高于本地跑一遍。没有 `cargo test --locked`
 跑过的改动不许提交。
+
+**python feature 例外**：绑定层（`crates/*/src/python`）由 `#[cfg(feature = "python")]`
+门控，上面这条不带 feature 的 clippy 编译不到它们，改动绑定层时必须补跑
+`make python-lint`（CI 已有同名 job，是阻断性的）。注意绑定层的单测**只能编译校验、
+无法运行**：pyo3 的 `extension-module` 不链接 libpython，`cargo test --features python`
+必然在链接阶段失败。详见 `docs/zh/about/contributing.md`。
 
 ## pre-commit hook（可选）
 

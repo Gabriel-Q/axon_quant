@@ -68,6 +68,12 @@ fmt-check: ## 检查格式（不修改）
 clippy: ## 运行 clippy 静态分析
 	cargo clippy --workspace --all-targets -- $(RUSTFLAGS)
 
+.PHONY: python-lint
+python-lint: ## 校验 python feature 的绑定层（含其单测）编译与 lint
+	# 绑定层(crates/*/src/python)由 #[cfg(feature = "python")] 门控，
+	# 普通 clippy/test 编译不到；这个 target 与 CI 的 python-lint job 等价。
+	cargo clippy --workspace --all-targets --features python --locked -- $(RUSTFLAGS)
+
 # ==================== 清理 ====================
 .PHONY: clean
 clean: ## 清理构建产物
@@ -232,6 +238,7 @@ verify: toolchain-check fmt-check ## 完整本地验证（等价于 CI）
 	# clippy/test/build 显式加 --locked,与 CI 行为一致:tch 依赖的 zip 0.6.x 已被 yanked,
 	# 无锁文件时全新解析会失败。日常开发用 make build/test/clippy(不带 --locked)即可。
 	cargo clippy --workspace --all-targets --locked -- $(RUSTFLAGS)
+	cargo clippy --workspace --all-targets --features python --locked -- $(RUSTFLAGS)
 	cargo test --workspace --locked
 	cargo build --workspace --locked
 	@echo "✅ 所有本地检查通过"

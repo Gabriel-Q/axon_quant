@@ -40,6 +40,33 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # 绑定层（crates/*/src/python）由 `#[cfg(feature = "python")]` 门控，普通
+  # clippy/test 编译不到；这个 job 专门编译校验绑定代码 + 其单测，
+  # 避免 pyo3 API 漂移（如 0.20→0.28）到发版才暴露。
+  # 注：pyo3 的 extension-module 不链接 libpython，故只能编译校验，
+  # 无法 `cargo test --features python`（链接阶段必然失败，详见
+  # docs/zh/about/contributing.md 的「Python 绑定层」小节）。
+  python-lint:
+    name: Clippy (python feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          # pyo3 的 build script 需要一个解释器来推导 cfgs；版本与
+          # pyproject.toml 的 requires-python(>=3.13,<3.15) 对齐。
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-lint
+      - name: Run clippy (python feature)
+        env:
+          PYO3_PYTHON: python3
+        run: cargo clippy --workspace --all-targets --features python --locked -- -D warnings
+
   # ==================== 测试矩阵 ====================
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.rust }})
@@ -58,8 +85,8 @@ jobs:
         with:
           key: ${{ matrix.os }}-${{ matrix.rust }}
       - name: Run unit tests
-        # 注：不使用 --all-features，避免触发 axon-rl/hpo/walk-forward/distributed
-        # 的 python feature 编译，导致 GitHub runner 上 PyO3 0.23 与 Python 3.14 不兼容。
+        # 注：不使用 --all-features，避免 python feature 连带拉入
+        # axon-rl/hpo/walk-forward/distributed 的绑定层与 onnx/tch 等重依赖。
         # --locked:tch 依赖的 zip 0.6.x 已被 yanked,需锁文件中的版本。
         run: cargo test --workspace --locked
 
@@ -93,8 +120,8 @@ jobs:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compatibility
-        # 注：不使用 --all-features，避免触发 axon-rl/hpo/walk-forward/distributed
-        # 的 python feature 编译，导致 GitHub runner 上 PyO3 0.23 与 Python 3.14 不兼容。
+        # 注：不使用 --all-features，避免 python feature 连带拉入
+        # axon-rl/hpo/walk-forward/distributed 的绑定层与 onnx/tch 等重依赖。
         # --locked:tch 依赖的 zip 0.6.x 已被 yanked,需锁文件中的版本。
         run: cargo check --workspace --locked
 
@@ -108,9 +135,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build documentation
-        # 注：不使用 --all-features，避免触发 axon-rl/hpo/walk-forward/distributed
-        # 的 python feature，进而避免 GitHub runner 上 PyO3 0.23 与 Python 3.14 不兼容的编译错误。
-        # 默认 features 已能覆盖 6 个 crate 的 lib 文档。
+        # 注：不使用 --all-features，避免 python feature 连带拉入绑定层与
+        # onnx/tch 等重依赖。默认 features 已能覆盖 6 个 crate 的 lib 文档。
         # --locked:tch 依赖的 zip 0.6.x 已被 yanked,需锁文件中的版本。
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
@@ -148,6 +174,7 @@ jobs:
     needs:
       - fmt
       - clippy
+      - python-lint
       - test
       - build
       - msrv
@@ -158,6 +185,7 @@ jobs:
         run: |
           if [[ "${{ needs.fmt.result }}" != "success" ]] ||
              [[ "${{ needs.clippy.result }}" != "success" ]] ||
+             [[ "${{ needs.python-lint.result }}" != "success" ]] ||
              [[ "${{ needs.test.result }}" != "success" ]] ||
              [[ "${{ needs.build.result }}" != "success" ]] ||
              [[ "${{ needs.docs-drift.result }}" != "success" ]]; then
