@@ -61,7 +61,6 @@ pub fn register_error_variants(parent: &Bound<'_, PyModule>) -> pyo3::PyResult<(
 mod tests {
     use super::*;
     use pyo3::Python;
-    use pyo3::prelude::*;
 
     #[test]
     fn test_to_py_err_unsupported_chain() {

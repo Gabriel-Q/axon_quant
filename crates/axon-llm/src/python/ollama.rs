@@ -146,7 +146,6 @@ pub fn make_ollama_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BackendConfig, ExplainConfig, RetryConfig};
 
     #[test]
     fn parse_py_message_dict_basic() {

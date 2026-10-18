@@ -767,6 +767,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axon_core::types::Instrument;
     use pyo3::Python;
 
     // ─── dict_to_order 单元测试 ────────────────────────
@@ -785,7 +786,10 @@ mod tests {
             d.set_item("tif", "GTC").unwrap();
             let order = dict_to_order(&d).unwrap();
             assert_eq!(order.id, 1);
-            assert_eq!(order.symbol, Symbol::from("BTC-USDT"));
+            assert_eq!(
+                order.instrument,
+                Instrument::from_symbol(&Symbol::from("BTC-USDT"))
+            );
             assert_eq!(order.side, CoreSide::Buy);
             assert!(matches!(order.order_type, OrderType::Limit { .. }));
             assert_eq!(order.time_in_force, TimeInForce::GTC);
@@ -896,7 +900,10 @@ mod tests {
             let p = dict_to_portfolio(&d).unwrap();
             assert!((p.base_cash() - 50_000.0).abs() < 1e-6);
             assert_eq!(p.positions().len(), 1);
-            let pos = p.position(&Symbol::from("BTC-USDT")).unwrap();
+            let pos = p
+                .positions()
+                .get(&Instrument::from_symbol(&Symbol::from("BTC-USDT")))
+                .unwrap();
             assert_eq!(pos.quantity, Quantity::from_f64(1.0));
             assert_eq!(pos.avg_cost, Price::from_f64(50_000.0));
             assert_eq!(pos.market_price, Some(Price::from_f64(55_000.0)));

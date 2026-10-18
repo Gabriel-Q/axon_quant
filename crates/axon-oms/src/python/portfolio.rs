@@ -331,6 +331,19 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// 额外方法(放在主 impl 之外作为 helper，便于测试使用)
+impl PyPortfolio {
+    /// 供测试访问单 symbol 持仓(避免暴露 `inner`)
+    pub fn get_position(&self, _py: Python<'_>, symbol: &str) -> Option<PyPosition> {
+        self.inner
+            .lock()
+            .positions
+            .get(symbol)
+            .cloned()
+            .map(|inner| PyPosition { inner })
+    }
+}
+
 // ===== 测试 =====
 
 #[cfg(test)]
@@ -653,18 +666,5 @@ mod tests {
             let as_of: String = d.get_item("as_of").unwrap().unwrap().extract().unwrap();
             assert!(as_of.contains('T'));
         });
-    }
-}
-
-// 额外方法(放在主 impl 之外作为 helper trait,便于测试使用)
-impl PyPortfolio {
-    /// 供测试访问单 symbol 持仓(避免暴露 `inner`)
-    pub fn get_position(&self, _py: Python<'_>, symbol: &str) -> Option<PyPosition> {
-        self.inner
-            .lock()
-            .positions
-            .get(symbol)
-            .cloned()
-            .map(|inner| PyPosition { inner })
     }
 }

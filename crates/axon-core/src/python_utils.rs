@@ -120,7 +120,9 @@ macro_rules! dict_field {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // 宏 py_exception! 生成 register()，测试里不会调用；item 级 allow 对宏展开不生效，故放模块级
+    #![allow(dead_code)]
+
     use pyo3::Python;
     use pyo3::prelude::*;
 
@@ -142,6 +144,7 @@ mod tests {
 
     use TestError::{Invalid, NotFound};
 
+    // 测试只覆盖 to_py_err / From 转换
     py_exception!(
         test_module,
         TestPyError,
@@ -174,9 +177,9 @@ mod tests {
         });
     }
 
-    // 测试用的枚举
+    // 测试用的枚举（pub：宏生成的 parse_test_side 是 pub fn，返回值类型不能更私有）
     #[derive(Debug, PartialEq)]
-    enum TestSide {
+    pub enum TestSide {
         Buy,
         Sell,
     }

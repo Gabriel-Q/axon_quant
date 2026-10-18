@@ -373,28 +373,17 @@ mod tests {
             );
             // instrument 是 dict 形式:{kind, base, quote}
             let inst = d.get_item("instrument").unwrap().unwrap();
+            // pyo3 0.28: PyAnyMethods::get_item 直接返回 PyResult<Bound<PyAny>>（缺 key 抛 KeyError），无 Option 层
             assert_eq!(
-                inst.get_item("kind")
-                    .unwrap()
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
+                inst.get_item("kind").unwrap().extract::<String>().unwrap(),
                 "spot"
             );
             assert_eq!(
-                inst.get_item("base")
-                    .unwrap()
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
+                inst.get_item("base").unwrap().extract::<String>().unwrap(),
                 "BTC"
             );
             assert_eq!(
-                inst.get_item("quote")
-                    .unwrap()
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
+                inst.get_item("quote").unwrap().extract::<String>().unwrap(),
                 "USDT"
             );
             assert_eq!(

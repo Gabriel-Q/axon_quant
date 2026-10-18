@@ -22,6 +22,11 @@
 //!
 //! 数据契约参考:`.axon-internal/specs/2026-06-19-python-bindings-expansion-design.md` §8 Stage 1。
 
+// pyo3 0.28 的 `from_py_object` 生成的 FromPyObject impl 里对 Copy 枚举调用 `Clone::clone`
+// （pyo3-macros-backend/src/pyclass.rs:2918），触发 clippy::clone_on_copy 误报。
+// 该误报在绑定层之外不存在，pyo3 上游修好后移除本 allow。
+#![allow(clippy::clone_on_copy)]
+
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -372,6 +377,22 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// 避免 `Pin` 引入未用 import 的 warning(若编译器优化不需要则忽略)
+#[allow(dead_code)]
+fn _pin_type_assert() {
+    // 编译期断言:`Pin<Box<dyn Stream + Send>>` 是 `Send`
+    fn assert_send<T: Send>() {}
+    assert_send::<
+        Pin<
+            Box<
+                dyn futures_core::Stream<
+                        Item = crate::error::DataResult<arrow::record_batch::RecordBatch>,
+                    > + Send,
+            >,
+        >,
+    >();
+}
+
 // ===== 测试 =====
 
 #[cfg(test)]
@@ -570,20 +591,4 @@ mod tests {
         assert!(r.contains("DataService"));
         assert!(r.contains("64"));
     }
-}
-
-// 避免 `Pin` 引入未用 import 的 warning(若编译器优化不需要则忽略)
-#[allow(dead_code)]
-fn _pin_type_assert() {
-    // 编译期断言:`Pin<Box<dyn Stream + Send>>` 是 `Send`
-    fn assert_send<T: Send>() {}
-    assert_send::<
-        Pin<
-            Box<
-                dyn futures_core::Stream<
-                        Item = crate::error::DataResult<arrow::record_batch::RecordBatch>,
-                    > + Send,
-            >,
-        >,
-    >();
 }

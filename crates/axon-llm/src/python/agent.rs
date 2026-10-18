@@ -280,9 +280,9 @@ impl Tool for PyToolWrapper {
     async fn execute(&self, arguments: &str) -> Result<String, crate::tools::ToolError> {
         let py_tool = self.py_tool.clone();
 
-        let py_result = Python::try_attach(|py| {
+        Python::try_attach(|py| {
             let py_tool_obj = py_tool.lock().unwrap();
-            let args = PyTuple::new(py, &[arguments]).map_err(|e| {
+            let args = PyTuple::new(py, [arguments]).map_err(|e| {
                 crate::tools::ToolError::ExecutionFailed(format!(
                     "Python tool execution failed: {}",
                     e
@@ -296,20 +296,18 @@ impl Tool for PyToolWrapper {
                         e
                     ))
                 })?;
-            Ok(result.extract::<String>(py).map_err(|e| {
+            result.extract::<String>(py).map_err(|e| {
                 crate::tools::ToolError::ExecutionFailed(format!(
                     "Python tool result extraction failed: {}",
                     e
                 ))
-            })?)
+            })
         })
         .ok_or_else(|| {
             crate::tools::ToolError::ExecutionFailed(
                 "Failed to attach to Python interpreter".to_string(),
             )
-        })?;
-
-        py_result
+        })?
     }
 }
 

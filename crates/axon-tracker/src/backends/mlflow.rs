@@ -72,12 +72,11 @@ impl MlflowTracker {
         let parsed: serde_json::Value = resp
             .json()
             .map_err(|e| TrackerError::Parse(e.to_string()))?;
-        if let Some(experiments) = parsed["experiments"].as_array() {
-            if let Some(exp) = experiments.first() {
-                if let Some(id) = exp["experiment_id"].as_str() {
-                    return Ok(id.to_string());
-                }
-            }
+        if let Some(experiments) = parsed["experiments"].as_array()
+            && let Some(exp) = experiments.first()
+            && let Some(id) = exp["experiment_id"].as_str()
+        {
+            return Ok(id.to_string());
         }
         let url = base_uri
             .join("api/2.0/mlflow/experiments/create")

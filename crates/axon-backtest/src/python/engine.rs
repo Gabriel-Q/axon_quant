@@ -1708,12 +1708,13 @@ mod tests {
     #[test]
     fn with_matching_engine_accepts_submit_method() {
         Python::attach(|py| {
-            let mut e = PyBacktestEngine::new(100_000.0).unwrap();
+            // pyo3 0.28:with_matching_engine 的接收者是 PyRefMut<Self>，需先落到 Python 对象上再 borrow_mut
+            let e = Bound::new(py, PyBacktestEngine::new(100_000.0).unwrap()).unwrap();
             // 任何含 `submit` 方法的对象都通过(完整替换语义留待 Stage 3)
             let cls = py
                 .eval(c"type('X', (), {'submit': lambda self, d: {}})", None, None)
                 .unwrap();
-            e.with_matching_engine(&cls).unwrap();
+            PyBacktestEngine::with_matching_engine(e.borrow_mut(), &cls).unwrap();
         });
     }
 
@@ -1721,9 +1722,13 @@ mod tests {
     #[test]
     fn with_matching_engine_rejects_no_submit() {
         Python::attach(|py| {
-            let mut e = PyBacktestEngine::new(100_000.0).unwrap();
+            let e = Bound::new(py, PyBacktestEngine::new(100_000.0).unwrap()).unwrap();
             let cls = py.eval(c"type('X', (), {})", None, None).unwrap();
-            let err = e.with_matching_engine(&cls).unwrap_err();
+            // 不用 unwrap_err()：Ok 分支是 PyRefMut，会要求 PyBacktestEngine: Debug
+            let err = match PyBacktestEngine::with_matching_engine(e.borrow_mut(), &cls) {
+                Err(e) => e,
+                Ok(_) => panic!("expected PyValueError for engine without submit"),
+            };
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
