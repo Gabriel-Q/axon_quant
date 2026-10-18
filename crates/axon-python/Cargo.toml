@@ -56,7 +56,7 @@ python = [
     # 包含 HarnessBridge / CircuitBreaker / AuditChain / PositionGuard 等类型。
     "dep:axon-harness",
     # `axon-strategy` 暴露为 `_native.strategy` 子模块
-    # 包含 Strategy trait 的三个内置实现（SDM / Rule / SwarmRoute）+ BacktestRunnerConfig DTO。
+    # 包含 Strategy trait 的三个内置实现（SDM / Rule / SwarmRoute）。
     "dep:axon-strategy",
     # `axon-worker` 暴露为 `_native.worker` 子模块
     # 包含 BacktestRunner（全 Rust 原生回测编排）+ StrategyManager + BacktestResult DTO。

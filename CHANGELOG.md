@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Python 绑定
 
-- `axon_quant.strategy`：`RuleStrategyImpl`、`BacktestRunnerConfig`
+- `axon_quant.strategy`：`RuleStrategyImpl`
 - `axon_quant.worker`：`BacktestRunner(initial_cash, futures=False, force_liquidate=False)`（`add_strategy` / `run`）、`BacktestResult`
   - `run(bars, states_by_symbol=None, funding_by_symbol=None)`：states 值为 list 时逐 bar 注入，为单对象时展开为「每 bar 同值」
   - `BacktestResult` 字段与 `RunResult` 对齐：`trades` / `fills_detail` / `equity_curve` / `bar_nav_curve` / `nav_peak` / `max_drawdown_pct` / `win_rate` / `sharpe_ratio` / `total_fees` / `final_positions` 等

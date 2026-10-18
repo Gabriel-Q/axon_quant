@@ -992,7 +992,6 @@ print(d["action"], d["source"], d["confidence"])
 | 类 | 说明 |
 |----|------|
 | `RuleStrategyImpl(name, symbol)` | 内置双均线规则策略(读 `state["features"]` 的 `sma5_vs_sma20` / `ret_1`) |
-| `BacktestRunnerConfig(initial_cash=100000.0, harness_mode=None)` | 回测配置 DTO |
 
 自定义 Python 策略**无需继承基类**:只需实现 `decide(bar_dict)` 或 `on_bar(bar_dict)`,返回含 `action_type`(`"buy"` / `"sell"` / `"hold"`)/ `confidence` / `target_position` 的 dict 或对象,即可注册到 `BacktestRunner`。
 

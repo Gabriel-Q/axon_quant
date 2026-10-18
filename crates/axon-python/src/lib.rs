@@ -173,8 +173,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&harness_module)?;
 
     // `axon-strategy` 子模块（Phase 1 Rust 原生策略层）
-    // 包含 Strategy trait + SdmStrategyImpl / RuleStrategyImpl / SwarmRouteStrategyImpl
-    // + BacktestRunnerConfig DTO。
+    // 包含 Strategy trait + SdmStrategyImpl / RuleStrategyImpl / SwarmRouteStrategyImpl。
     let strategy_module = PyModule::new(m.py(), "strategy")?;
     axon_strategy::python::register_module(&strategy_module)?;
     m.add_submodule(&strategy_module)?;

@@ -107,7 +107,6 @@ Python bindings of `axon-strategy`, unifying strategies behind a `decide(bar) ->
 | Class | Description |
 |-------|-------------|
 | `RuleStrategyImpl(name, symbol)` | Built-in dual-MA rule strategy (reads `sma5_vs_sma20` / `ret_1` from `state["features"]`) |
-| `BacktestRunnerConfig(initial_cash=100000.0, harness_mode=None)` | Backtest config DTO |
 
 Custom Python strategies **need no base class**: just implement `decide(bar_dict)` or `on_bar(bar_dict)` returning a dict (or object) with `action_type` (`"buy"` / `"sell"` / `"hold"`) / `confidence` / `target_position`, then register it on a `BacktestRunner`.
 

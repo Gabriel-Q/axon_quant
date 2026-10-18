@@ -43,7 +43,7 @@ use serde::Serialize;
 //
 // ponytail: 这几个值硬编码对齐 QuantCell `backtest_loop.py` 的 `_DEFAULT_*`
 // 常量，使 Rust 编排路径与现有 Python 编排路径撮合口径一致（parity）。
-// 上限：跨项目耦合，多消费者或需调参时改走 `BacktestRunnerConfig` 下发。
+// 上限：跨项目耦合，多消费者或需调参时改走 `BacktestRunner` 构造参数下发。
 const REBALANCE_THRESHOLD: f64 = 0.001; // 对应 _DEFAULT_AUTO_REBALANCE_THRESHOLD
 const SEED_HALF_SPREAD: f64 = 0.0005; // 对应 _DEFAULT_HALF_SPREAD_RATIO
 const SEED_DEPTH_LEVELS: usize = 5; // 对应 _DEFAULT_DEPTH_LEVELS
