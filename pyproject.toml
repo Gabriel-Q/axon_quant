@@ -48,6 +48,8 @@ dev = [
     "pytest-cov>=4.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    # tests/python/test_run_50bar_mock.py 用 JSON Schema 校验 trajectory 输出
+    "jsonschema>=4.0.0",
 ]
 
 [build-system]

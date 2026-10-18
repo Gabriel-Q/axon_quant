@@ -89,7 +89,9 @@ jobs:
         run: |
           python -m venv .venv
           . .venv/bin/activate
-          pip install maturin pytest
+          # jsonschema 是测试依赖（tests/python/test_run_50bar_mock.py 校验 trajectory
+          # JSON Schema），与 pyproject 的 dev extra 保持一致
+          pip install maturin pytest jsonschema
           maturin develop
       - name: Run pytest
         run: |
