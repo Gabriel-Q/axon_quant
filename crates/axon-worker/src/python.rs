@@ -241,15 +241,33 @@ pub struct PyBacktestRunner {
 #[pymethods]
 impl PyBacktestRunner {
     #[new]
-    #[pyo3(signature = (initial_cash=100000.0, futures=false, force_liquidate=false))]
-    fn new(initial_cash: f64, futures: bool, force_liquidate: bool) -> PyResult<Self> {
+    #[pyo3(signature = (initial_cash=100000.0, futures=false, force_liquidate=false, settle=None, contract_size=1.0))]
+    fn new(
+        initial_cash: f64,
+        futures: bool,
+        force_liquidate: bool,
+        settle: Option<String>,
+        contract_size: f64,
+    ) -> PyResult<Self> {
         let runtime = tokio::runtime::Runtime::new().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("创建 tokio runtime 失败: {e}"))
         })?;
         let mut runner = BacktestRunner::simple(initial_cash);
         if futures {
-            // QuantCell futures 口径：USD 保证金 + 合约乘数 1.0
-            runner = runner.with_futures(SwapSettle::UsdMargin, 1.0);
+            // 保证金结算方式：`usd_margin`（U 本位，默认）/ `coin_margin`（币本位）；
+            // 合约乘数默认 1.0。注意 `contract_size` 目前只是品种元数据 ——
+            // axon-backtest 引擎尚未把乘数计入名义价值/盈亏（engine.rs 里挂着 0.8.0 待办），
+            // 币本位只有结算方式被如实标注，账务仍是近似。
+            let settle = match settle.as_deref().unwrap_or("usd_margin") {
+                "usd_margin" => SwapSettle::UsdMargin,
+                "coin_margin" => SwapSettle::CoinMargin,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown settle: {other} (expected 'usd_margin' / 'coin_margin')"
+                    )));
+                }
+            };
+            runner = runner.with_futures(settle, contract_size);
         }
         // 回测结束 EOD 强制平仓
         runner = runner.with_force_liquidate(force_liquidate);

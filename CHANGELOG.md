@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Python 绑定
 
 - `axon_quant.strategy`：`RuleStrategyImpl`
-- `axon_quant.worker`：`BacktestRunner(initial_cash, futures=False, force_liquidate=False)`（`add_strategy` / `run`）、`BacktestResult`
+- `axon_quant.worker`：`BacktestRunner(initial_cash, futures=False, force_liquidate=False, settle=None, contract_size=1.0)`（`add_strategy` / `run`）、`BacktestResult`
+  - `settle` 取 `"usd_margin"`（默认）/ `"coin_margin"`（币本位），未知取值抛 `PyValueError`；`contract_size` 默认 1.0。注意乘数目前只作品种元数据 —— `axon-backtest` 引擎尚未把乘数计入名义价值/盈亏（`engine.rs` 挂着 0.8.0 待办），币本位只有结算方式被如实标注，账务仍是近似
   - `run(bars, states_by_symbol=None, funding_by_symbol=None)`：states 值为 list 时逐 bar 注入，为单对象时展开为「每 bar 同值」
   - `BacktestResult` 字段与 `RunResult` 对齐：`trades` / `fills_detail` / `equity_curve` / `bar_nav_curve` / `nav_peak` / `max_drawdown_pct` / `win_rate` / `sharpe_ratio` / `total_fees` / `final_positions` 等
 - 自定义 Python 策略无需基类，实现 `decide(bar)` / `on_bar(bar)` 即可注册到 `BacktestRunner`

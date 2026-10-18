@@ -1001,7 +1001,7 @@ print(d["action"], d["source"], d["confidence"])
 
 | 类 / 方法 | 说明 |
 |-----------|------|
-| `BacktestRunner(initial_cash=100000.0, futures=False, force_liquidate=False)` | 回测编排器(内部独占 tokio runtime)。`futures=True` 用永续合约品种(USD 保证金 / 乘数 1.0)并支持资金费结算;`force_liquidate=True` 回测结束 EOD 强制市价平仓 |
+| `BacktestRunner(initial_cash=100000.0, futures=False, force_liquidate=False, settle=None, contract_size=1.0)` | 回测编排器(内部独占 tokio runtime)。`futures=True` 用永续合约品种并支持资金费结算,`settle` 取 `"usd_margin"`(默认)/`"coin_margin"`,`contract_size` 默认 1.0;`force_liquidate=True` 回测结束 EOD 强制市价平仓 |
 | `runner.add_strategy(strategy, name=None, symbol=None)` | 注册策略:支持 `strategy.RuleStrategyImpl` 实例,或任意实现 `decide(bar)` / `on_bar(bar)` 的 Python 对象 |
 | `runner.run(bars, states_by_symbol=None, funding_by_symbol=None)` | 同步执行回测,返回 `BacktestResult` |
 | `BacktestResult` | 回测结果 DTO(只由 `run()` 返回,不可直接实例化) |

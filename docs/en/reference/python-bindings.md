@@ -116,7 +116,7 @@ Python bindings of `axon-worker`: per-bar strategy orchestration into `BacktestE
 
 | Class / method | Description |
 |----------------|-------------|
-| `BacktestRunner(initial_cash=100000.0, futures=False, force_liquidate=False)` | Backtest orchestrator (owns a dedicated tokio runtime). `futures=True` uses a perpetual-swap instrument (USD margin / contract size 1.0) and enables funding settlement; `force_liquidate=True` force-liquidates at EOD |
+| `BacktestRunner(initial_cash=100000.0, futures=False, force_liquidate=False, settle=None, contract_size=1.0)` | Backtest orchestrator (owns a dedicated tokio runtime). `futures=True` uses a perpetual-swap instrument and enables funding settlement; `settle` is `"usd_margin"` (default) or `"coin_margin"`, `contract_size` defaults to 1.0; `force_liquidate=True` force-liquidates at EOD |
 | `runner.add_strategy(strategy, name=None, symbol=None)` | Register a strategy: a `strategy.RuleStrategyImpl` instance, or any Python object implementing `decide(bar)` / `on_bar(bar)` |
 | `runner.run(bars, states_by_symbol=None, funding_by_symbol=None)` | Run the backtest synchronously, returns `BacktestResult` |
 | `BacktestResult` | Result DTO (returned by `run()` only; not directly instantiable) |
