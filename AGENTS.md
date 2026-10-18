@@ -31,6 +31,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --features python --locked -- -D warnings
                                              # = make python-lint，见下
 cargo test  --workspace --locked             # 跑过再提交,避免 CI 才炸
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+                                             # = make doc-check，等价 CI 的 docs job
 ```
 
 **铁律**：CI 挂了再修的成本远高于本地跑一遍。没有 `cargo test --locked`

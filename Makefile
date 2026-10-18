@@ -74,6 +74,11 @@ python-lint: ## 校验 python feature 的绑定层（含其单测）编译与 li
 	# 普通 clippy/test 编译不到；这个 target 与 CI 的 python-lint job 等价。
 	cargo clippy --workspace --all-targets --features python --locked -- $(RUSTFLAGS)
 
+.PHONY: doc-check
+doc-check: ## rustdoc 链接/警告校验（等价于 CI 的 docs job）
+	# CI 的 docs job 用默认 features（不含 python / onnx），这里保持一致
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
 # ==================== 清理 ====================
 .PHONY: clean
 clean: ## 清理构建产物
@@ -240,6 +245,7 @@ verify: toolchain-check fmt-check ## 完整本地验证（等价于 CI）
 	cargo clippy --workspace --all-targets --locked -- $(RUSTFLAGS)
 	cargo clippy --workspace --all-targets --features python --locked -- $(RUSTFLAGS)
 	cargo test --workspace --locked
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	cargo build --workspace --locked
 	@echo "✅ 所有本地检查通过"
 
