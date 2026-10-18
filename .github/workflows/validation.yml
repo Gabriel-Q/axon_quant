@@ -67,6 +67,35 @@ jobs:
           PYO3_PYTHON: python3
         run: cargo clippy --workspace --all-targets --features python --locked -- -D warnings
 
+  # 绑定层的行为测试（tests/python，142 个 pytest 用例）。这是唯一会真正编译
+  # 扩展模块并安装运行的一环，因此同时覆盖「wheel 能否构建」这一风险。
+  # 3 个需要 testnet 凭据/网络的脚本由 tests/python/conftest.py 的 collect_ignore 排除。
+  # 本地等价命令：make python-develop && make python-test
+  python-test:
+    name: Python tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-test
+      - name: Build & install extension (dev profile)
+        env:
+          PYO3_PYTHON: python3
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest
+          maturin develop
+      - name: Run pytest
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/python -q
+
   # ==================== 测试矩阵 ====================
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.rust }})
@@ -175,6 +204,7 @@ jobs:
       - fmt
       - clippy
       - python-lint
+      - python-test
       - test
       - build
       - msrv
@@ -186,6 +216,7 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] ||
              [[ "${{ needs.clippy.result }}" != "success" ]] ||
              [[ "${{ needs.python-lint.result }}" != "success" ]] ||
+             [[ "${{ needs.python-test.result }}" != "success" ]] ||
              [[ "${{ needs.test.result }}" != "success" ]] ||
              [[ "${{ needs.build.result }}" != "success" ]] ||
              [[ "${{ needs.docs-drift.result }}" != "success" ]]; then

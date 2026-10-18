@@ -130,6 +130,11 @@ python-build: ## 构建 Python wheel（包含 Rust 扩展）
 python-develop: ## 安装 Python 包到当前环境（开发模式）
 	PYO3_PYTHON=$(VENV_PYTHON) $(VENV_MATURIN) develop
 
+.PHONY: python-test
+python-test: ## 跑绑定层 pytest（需先 make python-develop 装上扩展模块）
+	# 只跑 tests/python：其中 3 个「直接运行」的脚本由 conftest.collect_ignore 排除
+	$(VENV_PYTHON) -m pytest tests/python -q
+
 .PHONY: python-install
 python-install: python-build ## 安装 Python wheel(uv venv: uv pip install;传统 venv: .venv/bin/pip)
 	@if [ -x "$$(command -v uv)" ] && [ -d ".venv" ] && [ ! -x ".venv/bin/pip" ]; then \

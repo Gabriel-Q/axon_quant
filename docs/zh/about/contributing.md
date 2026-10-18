@@ -81,8 +81,11 @@ make python-lint
    调用 `Clone::clone`（上游宏展开的误报），绑定模块因此带模块级
    `#![allow(clippy::clone_on_copy)]`；上游修好后应移除。
 
-绑定层的**行为**验证另有一套 `tests/python/`（pytest，158 个用例，需先
-`maturin develop --release`），目前未接入 CI，属改动绑定层时的手动验证。
+绑定层的**行为**验证另有 `tests/python/`（pytest，142 个用例），已接入 CI 的
+`python-test` job（阻断性）：本地等价命令是 `make python-develop && make python-test`。
+其中 3 个需要 testnet API key / 真实网络的脚本（`test_all_scenarios.py`、
+`test_binance_adapter.py`、`test_okx_adapter.py`）由
+`tests/python/conftest.py` 的 `collect_ignore` 排除，仍按各自文件头说明单独运行。
 
 ## Crate 责任分工
 

@@ -42,7 +42,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 门控，上面这条不带 feature 的 clippy 编译不到它们，改动绑定层时必须补跑
 `make python-lint`（CI 已有同名 job，是阻断性的）。注意绑定层的单测**只能编译校验、
 无法运行**：pyo3 的 `extension-module` 不链接 libpython，`cargo test --features python`
-必然在链接阶段失败。详见 `docs/zh/about/contributing.md`。
+必然在链接阶段失败。绑定层的**行为**验证走 `tests/python` 的 pytest（CI 的
+`python-test` job 也是阻断性的）：本地 `make python-develop && make python-test`。
+详见 `docs/zh/about/contributing.md`。
 
 ## pre-commit hook（可选）
 
