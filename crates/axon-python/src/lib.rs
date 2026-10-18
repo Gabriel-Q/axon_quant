@@ -179,7 +179,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&strategy_module)?;
 
     // `axon-worker` 子模块（Phase 1 Rust 原生编排层）
-    // 包含 BacktestRunner + StrategyManager + BacktestResult DTO。
+    // 包含 BacktestRunner + BacktestResult DTO。
     let worker_module = PyModule::new(m.py(), "worker")?;
     axon_worker::python::register_module(&worker_module)?;
     m.add_submodule(&worker_module)?;

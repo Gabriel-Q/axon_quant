@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `RuleStrategyImpl`：双均线规则策略
     - `SwarmRouteStrategyImpl`：快慢决策路由（低置信升级到慢路径）
     - `PythonStrategyImpl`：桥接 Python 的 `decide(bar)` / `on_bar(bar)` 到 Rust `Strategy`
-  - `axon-worker`：`BacktestRunner` 全 Rust 原生回测编排（逐 bar `decide` → `target_position` → `BacktestEngine` 真撮合）+ `StrategyManager` 单例注册表
+  - `axon-worker`：`BacktestRunner` 全 Rust 原生回测编排（逐 bar `decide` → `target_position` → `BacktestEngine` 真撮合）
     - 期货品种（`with_futures`）+ 逐 bar 资金费结算（`funding_by_symbol`，命中 bar 时刻即 `push_funding` + drain）
     - 逐 bar 状态注入：`states_by_symbol` 为列表时 `BarContext.state` 取第 i 项，`PythonStrategyImpl` 以 `bar["state"]` 透传给 Python 策略
     - EOD 强制平仓（`with_force_liquidate`）
