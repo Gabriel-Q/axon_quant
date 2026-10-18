@@ -36,6 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BacktestRunner` 结果与 `BacktestLoop` 不一致**：逐 bar 顺序（`begin_bar` 提前到策略决策之前 + 决策后补显式 `rebalance_to_target`，复刻「有成交则次 bar、无成交则同 bar」的条件语义）与 seed 流动性常量（`half_spread` / `size_per_level` / `auto_rebalance`）对齐 QuantCell `BacktestLoop` 后，同一策略 + 数据下两条路径结果 **bit-identical**。
 - **`BacktestResult.final_positions` 的 contract_size 类型不符**：曾把 `contract_size` 序列化成字符串（`"1"`），与 Python 端 `RunResult.positions` 的浮点元组（`1.0`）不一致，导致期货持仓 key 不匹配。改为直接持有 `Instrument`，Python 绑定复用 `instrument_to_tuple` 生成与 `RunResult` 完全一致的元组。
 
+## [0.17.2] - 2026-10-17
+
+### Fixed
+
+- **CI 在 `clippy -D warnings` 与 `cargo build --no-default-features` 下失败**：`axon-defi` 的 `V3Pool` / `V3Quoter` / `V3Router` / `Erc20Client` / `Multicall` 都存有 `provider: EvmProvider` 字段，但 struct 本身没有 `#[cfg(feature = "evm")]` gate（只有 impl 块按 feature 分叉）。CI 跑 `--no-default-features`（evm 关闭）时 stub impl 不碰 `self.provider` → `dead_code`；`hex_encode` 同理只在 `#[cfg(feature = "evm")]` 的方法里被调用却未加 gate。现给 5 个字段加 `#[cfg_attr(not(feature = "evm"), allow(dead_code))]`、给 `hex_encode` 加 `#[cfg(feature = "evm")]`，并为 `uniswap::amount_out_f64` / `signer::LocalSigner` 补齐 `missing_docs`。
+- 重新发布 0.17.1 的 `build_result` 口径修复（见下条）。
+
+## [0.17.1] - 2026-10-16
+
+### Fixed
+
+- **`build_result` 的 `final_nav` / `max_drawdown` / `nav_peak` 与权益曲线口径矛盾**：此前用 `equity_curve`（事件稀疏）计算，而前端权益曲线用 `bar_nav_curve`（每 bar 密集），有未平仓持仓时两者脱节——例如 `equity_curve` 最后一次 fill 之后持仓仍沿 mark 波动，`bar_nav_curve` 反映了这些波动但 `final_nav` 停在 fill 时刻的值，出现「最终权益 999.9 但曲线末尾 995.06」。现统一优先 `bar_nav_curve` 作为主曲线，为空时回退 `equity_curve`，两者都空时回退 `initial_cash`。
+
+## [0.17.0] - 2026-10-16
+
+### Added
+
+- **`TradeRecord` 新增 `entry_price` / `entry_time_ns`（round-trip 开仓信息下沉到引擎）**：由 `apply_fill` 6 状态机在平仓/反手分支写入（取 `PositionState.avg_cost` / `entry_time_ns`）。QuantCell 不再自行 FIFO 配对 `fills_detail`，直接消费 `result.trades` 映射为前端契约，保证 Σ `trade.pnl` 与引擎 `total_pnl` 口径一致，杜绝多空配对分歧。Python 绑定 `trades` getter 同步暴露这两个字段。
+
+### Build
+
+- **`Cargo.lock` 入库 + CI 全量 `--locked`**：`tch 0.24/0.26` 依赖 `zip ^0.6`，而 crates.io 上所有 `zip 0.6.x` 均已 yanked；`Cargo.lock` 原先被 gitignore，CI 每次重新解析依赖时选不出版本而失败。现从 `.gitignore` 移除 `Cargo.lock`（workspace 出货 `axon-cli` 二进制，锁文件应入库），CI 全部 cargo 命令（bench-nightly / validation / e2e-real-llm）加 `--locked` 防漂移，`make verify` 同步改 `--locked`；日常开发 target（build/test/clippy）保持不带 `--locked` 以便更新依赖。
+
 ## [0.16.1] - 2026-10-14
 
 ### Fixed
