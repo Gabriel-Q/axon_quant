@@ -55,6 +55,38 @@
 - Property-based 测试用 `proptest`,覆盖核心 impact / engine 模块
 - 性能敏感代码有 benchmark + 内存影响分析
 
+### Python 绑定层（编译校验）
+
+绑定代码（`crates/*/src/python/`）由 `#[cfg(feature = "python")]` 门控，普通
+`cargo clippy` / `cargo test` 编译不到它们，CI 里由 `Clippy (python feature)`
+job 兜底。本地等价命令（仓库规则要求用 `.venv` 下的 Python）：
+
+```bash
+make python-lint
+# = cargo clippy --workspace --all-targets --features python --locked -- -D warnings
+```
+
+三点须知：
+
+1. **绑定层的单测只能编译校验、无法运行**：pyo3 的 `extension-module` 不链接
+   libpython，`cargo test --features python` 在链接阶段必然失败。要让这 400+ 个
+   绑定层单测真正跑起来，需把 `extension-module` 拆成独立 feature 并由 maturin
+   显式启用，属待办改造。
+2. **升级 pyo3 后必须重跑这个 target**：0.20→0.28 迁移期间，绑定层的测试代码
+   静默失配（`get_item` 去掉了 `Option` 层、`PyRefMut<Self>` 接收者、`pyclass`
+   实例需先 `Bound::new` 再取 `Bound`、`_py` 参数名不符），因为 CI 从不编译
+   它们，直到 0.18.0 才被 `make python-lint` 一次性暴露。
+3. **`clippy::clone_on_copy` 是有意允许的**：pyo3 0.28 的
+   `#[pyclass(..., from_py_object)]` 生成的 `FromPyObject` impl 会对 `Copy` 枚举
+   调用 `Clone::clone`（上游宏展开的误报），绑定模块因此带模块级
+   `#![allow(clippy::clone_on_copy)]`；上游修好后应移除。
+
+绑定层的**行为**验证另有 `tests/python/`（pytest，142 个用例），已接入 CI 的
+`python-test` job（阻断性）：本地等价命令是 `make python-develop && make python-test`。
+其中 3 个需要 testnet API key / 真实网络的脚本（`test_all_scenarios.py`、
+`test_binance_adapter.py`、`test_okx_adapter.py`）由
+`tests/python/conftest.py` 的 `collect_ignore` 排除，仍按各自文件头说明单独运行。
+
 ## Crate 责任分工
 
 | Crate | 责任 |

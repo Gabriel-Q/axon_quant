@@ -1,6 +1,6 @@
 [project]
 name = "axon-quant"
-version = "0.17.2"
+version = "0.18.0"
 description = "AI-native quantitative trading framework — high-performance Rust core with Python RL training interface, covering backtesting, training, optimization, validation and production in a single codebase."
 authors = [{ name = "pengwow", email = "pengwow@hotmail.com" }]
 license = "Apache-2.0"
@@ -48,6 +48,8 @@ dev = [
     "pytest-cov>=4.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    # tests/python/test_run_50bar_mock.py 用 JSON Schema 校验 trajectory 输出
+    "jsonschema>=4.0.0",
 ]
 
 [build-system]

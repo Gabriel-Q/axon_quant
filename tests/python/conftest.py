@@ -3,6 +3,17 @@
 import random
 import math
 
+# 以下三个文件是「直接运行」的脚本，不是 pytest 用例，必须排除收集：
+# - test_all_scenarios.py：模块级跑完全部场景后调 sys.exit()，被收集会把整个
+#   pytest 会话打成 INTERNALERROR
+# - test_binance_adapter.py / test_okx_adapter.py：需要 testnet API key + 真实
+#   网络（见各自文件头的运行说明），CI 环境没有凭据
+collect_ignore = [
+    "test_all_scenarios.py",
+    "test_binance_adapter.py",
+    "test_okx_adapter.py",
+]
+
 
 def generate_ohlcv(n: int = 200, seed: int = 42, base_price: float = 50000.0) -> list[dict]:
     """生成模拟 OHLCV K 线数据

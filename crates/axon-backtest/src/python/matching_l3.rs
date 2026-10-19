@@ -1489,7 +1489,7 @@ mod tests {
 
     /// 构造 swap instrument dict 测试 helper
     fn swap_inst_dict<'py>(
-        _py: Python<'py>,
+        py: Python<'py>,
         base: &str,
         quote: &str,
         settle: &str,
@@ -1505,7 +1505,7 @@ mod tests {
     }
 
     fn make_limit_dict<'py>(
-        _py: Python<'py>,
+        py: Python<'py>,
         id: u64,
         inst: &Bound<'py, PyDict>,
         side: &str,
@@ -1682,8 +1682,13 @@ mod tests {
             let mut m = PyMultiAssetMatchingEngine::new();
             let btc_spot = spot_inst_dict(py, "BTC", "USDT");
             let btc_perp = swap_inst_dict(py, "BTC", "USDT", "usd_margin", 1.0);
-            let pair = PyCrossPair::new(&btc_spot, &btc_perp, 1.0, 0.5).unwrap();
-            m.register_cross_pair(py, &pair.as_any()).unwrap();
+            // pyo3 0.28:pyclass 实例须先落到 Python 对象上才能拿 Bound（原先是裸 Rust 值调 as_any）
+            let pair = Bound::new(
+                py,
+                PyCrossPair::new(&btc_spot, &btc_perp, 1.0, 0.5).unwrap(),
+            )
+            .unwrap();
+            m.register_cross_pair(py, pair.as_any()).unwrap();
             assert_eq!(m.cross_pair_count(), 1);
             // 自动 register 两个 instrument
             assert_eq!(m.asset_count(), 2);

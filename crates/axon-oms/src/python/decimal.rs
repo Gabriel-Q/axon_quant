@@ -105,7 +105,7 @@ mod tests {
             // 测我们的内部转换:传 None.__str__() → "None" → from_str 失败
             let none_obj = py.None();
             let none_bound = none_obj.bind(py);
-            let result = py_to_decimal(&none_bound);
+            let result = py_to_decimal(none_bound);
             assert!(result.is_err(), "expected PyValueError, got Ok");
         });
     }

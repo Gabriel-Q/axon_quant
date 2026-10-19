@@ -68,6 +68,17 @@ fmt-check: ## 检查格式（不修改）
 clippy: ## 运行 clippy 静态分析
 	cargo clippy --workspace --all-targets -- $(RUSTFLAGS)
 
+.PHONY: python-lint
+python-lint: ## 校验 python feature 的绑定层（含其单测）编译与 lint
+	# 绑定层(crates/*/src/python)由 #[cfg(feature = "python")] 门控，
+	# 普通 clippy/test 编译不到；这个 target 与 CI 的 python-lint job 等价。
+	cargo clippy --workspace --all-targets --features python --locked -- $(RUSTFLAGS)
+
+.PHONY: doc-check
+doc-check: ## rustdoc 链接/警告校验（等价于 CI 的 docs job）
+	# CI 的 docs job 用默认 features（不含 python / onnx），这里保持一致
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
 # ==================== 清理 ====================
 .PHONY: clean
 clean: ## 清理构建产物
@@ -118,6 +129,11 @@ python-build: ## 构建 Python wheel（包含 Rust 扩展）
 .PHONY: python-develop
 python-develop: ## 安装 Python 包到当前环境（开发模式）
 	PYO3_PYTHON=$(VENV_PYTHON) $(VENV_MATURIN) develop
+
+.PHONY: python-test
+python-test: ## 跑绑定层 pytest（需先 make python-develop 装上扩展模块）
+	# 只跑 tests/python：其中 3 个「直接运行」的脚本由 conftest.collect_ignore 排除
+	$(VENV_PYTHON) -m pytest tests/python -q
 
 .PHONY: python-install
 python-install: python-build ## 安装 Python wheel(uv venv: uv pip install;传统 venv: .venv/bin/pip)
@@ -232,7 +248,9 @@ verify: toolchain-check fmt-check ## 完整本地验证（等价于 CI）
 	# clippy/test/build 显式加 --locked,与 CI 行为一致:tch 依赖的 zip 0.6.x 已被 yanked,
 	# 无锁文件时全新解析会失败。日常开发用 make build/test/clippy(不带 --locked)即可。
 	cargo clippy --workspace --all-targets --locked -- $(RUSTFLAGS)
+	cargo clippy --workspace --all-targets --features python --locked -- $(RUSTFLAGS)
 	cargo test --workspace --locked
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	cargo build --workspace --locked
 	@echo "✅ 所有本地检查通过"
 

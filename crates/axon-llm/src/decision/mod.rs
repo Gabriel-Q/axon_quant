@@ -4,13 +4,15 @@
 //! - [`DecisionBackend`]：决策后端 trait
 //! - [`StubDecisionBackend`]：确定性模拟
 //! - [`ReplayDecisionBackend`]：指纹精确回放
-//! - [`SdmHttpBackend`]：真实 HTTP（`decision-http` feature）
+//! - `SdmHttpBackend`：真实 HTTP（`decision-http` feature；关闭时该 item 不编译，
+//!   因此这里不给文档链接，避免 `cargo doc` 报 broken intra-doc link）
 //! - [`SdmCascadeDecisionLayer`]：置信门控级联（直出 / 低置信兜底 / 异常兜底）
 
 pub mod backend;
 pub mod cascade;
 pub mod fingerprint;
 pub mod llm_fallback;
+pub mod quant_questions;
 pub mod replay;
 pub mod stub;
 pub mod types;

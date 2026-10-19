@@ -985,6 +985,77 @@ print(d["action"], d["source"], d["confidence"])
 
 > 真实 HTTP 后端需编译 `decision-http` feature;`with_llm_fallback` 可把低置信决策升级到 `LLMBackend` 复核。
 
+### `axon_quant.strategy`(`0.18.0` 新增)—— 统一策略层
+
+`axon-strategy` 的 Python 绑定:把策略统一为 `decide(bar) -> dict` 协议,回测与实盘复用同一入口。
+
+| 类 | 说明 |
+|----|------|
+| `RuleStrategyImpl(name, symbol)` | 内置双均线规则策略(读 `state["features"]` 的 `sma5_vs_sma20` / `ret_1`) |
+
+自定义 Python 策略**无需继承基类**:只需实现 `decide(bar_dict)` 或 `on_bar(bar_dict)`,返回含 `action_type`(`"buy"` / `"sell"` / `"hold"`)/ `confidence` / `target_position` 的 dict 或对象,即可注册到 `BacktestRunner`。
+
+### `axon_quant.worker`(`0.18.0` 新增)—— 全 Rust 原生回测编排
+
+`axon-worker` 的 Python 绑定:逐 bar 编排策略 → `BacktestEngine` 真撮合,产出与 `axon_quant.backtest.RunResult` 对齐的结果契约。
+
+| 类 / 方法 | 说明 |
+|-----------|------|
+| `BacktestRunner(initial_cash=100000.0, futures=False, force_liquidate=False, settle=None, contract_size=1.0)` | 回测编排器(内部独占 tokio runtime)。`futures=True` 用永续合约品种并支持资金费结算,`settle` 取 `"usd_margin"`(默认)/`"coin_margin"`,`contract_size` 默认 1.0;`force_liquidate=True` 回测结束 EOD 强制市价平仓 |
+| `runner.add_strategy(strategy, name=None, symbol=None)` | 注册策略:支持 `strategy.RuleStrategyImpl` 实例,或任意实现 `decide(bar)` / `on_bar(bar)` 的 Python 对象 |
+| `runner.run(bars, states_by_symbol=None, funding_by_symbol=None)` | 同步执行回测,返回 `BacktestResult` |
+| `BacktestResult` | 回测结果 DTO(只由 `run()` 返回,不可直接实例化) |
+
+`run()` 参数:
+
+| 参数 | 说明 |
+|------|------|
+| `states_by_symbol` | `dict[str, dict \| list[dict]]`:值为 **list** 时按**逐 bar** 注入(第 i 项对应第 i 根 bar);值为单对象时展开为「每 bar 同值」。Rust 侧会以 `bar["state"]` 透传给 Python 策略 |
+| `funding_by_symbol` | `dict[str, dict[int, tuple(rate, mark_price)]]`:资金费查找表,键为 bar 纳秒时间戳,命中即入队结算(现货传 `None`) |
+
+`BacktestResult` 字段(与 `RunResult` 对齐):
+
+| 字段 | 说明 |
+|------|------|
+| `fills` / `orders_accepted` / `orders_rejected` / `orders_cancelled` / `orders_modified` | 撮合统计 |
+| `total_pnl` / `final_nav` / `nav_peak` | PnL / 净值 |
+| `max_drawdown` / `max_drawdown_pct` | 最大回撤(USD / 小数比) |
+| `win_rate` / `sharpe_ratio` / `total_fees` / `total_funding_pnl` | 绩效指标 |
+| `trades` | round-trip 交易记录 `list[dict]` |
+| `fills_detail` | 每笔 fill 明细 `list[dict]` |
+| `equity_curve` / `bar_nav_curve` | NAV 曲线 `[(timestamp_ns, nav), ...]` |
+| `final_positions` | 终态持仓 `dict[tuple, float]` |
+| `duration_secs` / `final_time_ns` / `n_bars` / `n_strategies` / `rebalances_triggered` | 元信息 |
+
+#### 示例:Rust 原生回测
+
+```python
+from axon_quant import strategy, worker
+
+# 1) 构造 K 线(timestamp 为纳秒)
+bars = [
+    {"timestamp": 1_700_000_000_000_000_000 + i * 3_600_000_000_000,
+     "open": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i,
+     "close": 100.5 + i, "volume": 1000.0}
+    for i in range(5)
+]
+
+# 2) 注册 Rust 内置策略
+runner = worker.BacktestRunner(initial_cash=100_000.0)
+runner.add_strategy(strategy.RuleStrategyImpl("dual_ma", "BTC/USDT"))
+result = runner.run(
+    bars=bars,
+    states_by_symbol={"BTC/USDT": {"features": {"sma5_vs_sma20": 0.02, "ret_1": 0.01}}},
+)
+print(result.fills, result.final_nav, result.total_pnl)
+
+# 3) 或注册任意 Python 策略(实现 decide(bar) 或 on_bar(bar) 即可)
+runner.add_strategy(MyPythonStrategy(), name="my_py", symbol="BTC/USDT")
+result = runner.run(bars=bars)
+```
+
+> `symbol` 需为 `BASE/QUOTE` 格式(Rust `Instrument::from_symbol` 按 `/` 切分);无分隔符(如 `"BTCUSDT"`)会退化为空 base/quote。
+
 ## 示例:LLM 交易 Mock 端到端
 
 ```python

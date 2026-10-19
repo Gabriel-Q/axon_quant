@@ -157,7 +157,7 @@ impl PyGetBookSnapshotTool {
             10
         };
 
-        let args_tuple = PyTuple::new(py, &[levels])
+        let args_tuple = PyTuple::new(py, [levels])
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let depth_result = self
             .engine

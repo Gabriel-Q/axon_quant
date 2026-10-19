@@ -40,6 +40,8 @@ impl PyTrajectoryRecorder {
         recorder.trajectory_mut().run_id = run_id.to_string();
     }
 
+    // 参数个数由 Python 端 API（TrajectoryRecorder.record）决定，Rust 侧不做拆分
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (bar_id, ts, thought, action=None, observation=None, reward=0.0, cum_pnl=0.0))]
     fn record(
         &self,
@@ -186,7 +188,7 @@ mod tests {
 
     #[test]
     fn trajectory_recorder_record_adds_bar() {
-        run(|py| {
+        run(|_py| {
             let recorder = PyTrajectoryRecorder::new(42, "BTC-USDT", "mock", "test");
             recorder
                 .record(0, 1234567890, "bar 0", None, None, 0.0, 0.0)
