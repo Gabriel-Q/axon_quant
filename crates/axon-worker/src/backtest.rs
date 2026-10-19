@@ -834,7 +834,7 @@ mod tests {
             .collect()
     }
 
-    /// 不启用资金约束：两个品种按各自价格成交，trades 的 instrument 归属正确
+    /// 不启用资金约束：两个品种按各自价格成交，每笔成交的 instrument 归属正确
     #[tokio::test]
     async fn run_multi_two_symbols_uses_per_symbol_prices() {
         const N: usize = 5;
