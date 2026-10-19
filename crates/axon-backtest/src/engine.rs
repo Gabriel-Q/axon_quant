@@ -438,6 +438,17 @@ struct BacktestState {
     legs: HashMap<Instrument, LegConfig>,
     /// T3.5 新增:每 instrument 最新 mark 价格缓存(`Event::Mark` 写入)
     mark_cache: HashMap<Instrument, Price>,
+    /// 0.19.0 新增:当前 bar 各 instrument 的 mid_price(`begin_bar` / `begin_bar_multi` 写入)
+    ///
+    /// 用作 `compute_nav` 的 **per-instrument** mark fallback:`mark_cache` 缺该 instrument
+    /// 的 mark 时,优先取**该 instrument 自己本 bar 的 mid_price**。
+    ///
+    /// 为什么必须按 instrument 记:0.19.0 之前 `sample_bar_nav` 只接受一个标量
+    /// `mark_fallback`(取自 `begin_bar_multi` 的**末 leg** mid)。多 instrument 共享账户
+    /// 时所有持仓都会用末 leg 的价格估值 —— 例如 BTC 持仓被用 ETH 的价格盯市,
+    /// `bar_nav_curve` 因此完全失真,而 `final_nav` / `total_pnl` 又取自该曲线的末帧
+    /// (见 `build_result`),导致多品种回测 PnL 错误。
+    bar_mid_by_instrument: HashMap<Instrument, f64>,
     /// 0.5.0 新增(Phase C):累计 funding 结算 PnL(`Event::Funding` 累加)
     total_funding_pnl: f64,
     /// 0.7.1 新增:每 bar 末 mark-to-market NAV 曲线(`(Timestamp, nav)`)
@@ -840,6 +851,11 @@ impl BacktestEngine {
             .get(&instrument)
             .copied()
             .or(self.default_seed_liquidity_config);
+        // 0.19.0 新增:记录本 bar 该 instrument 的 mid_price,作为 compute_nav 的
+        // per-instrument mark fallback(必须在 instrument 被 seed_liquidity 移动前 clone)
+        self.bt_state
+            .bar_mid_by_instrument
+            .insert(instrument.clone(), mid_price);
         if let Some(cfg) = cfg {
             // ponytail:无效参数(no-op)与有效参数走同一路径,避免 L1 内部再判一次
             if mid_price > 0.0
@@ -928,6 +944,11 @@ impl BacktestEngine {
         let mut last_mid: f64 = 0.0;
         for (instrument, mid_price) in legs {
             last_mid = mid_price;
+            // 0.19.0 新增:per-instrument mid_price 供 compute_nav 回退估值
+            // (多 instrument 共用一个标量 fallback 会把 A 品种持仓用 B 品种价格盯市)
+            self.bt_state
+                .bar_mid_by_instrument
+                .insert(instrument.clone(), mid_price);
             let cfg = per_leg.get(&instrument).copied().or(default_cfg);
             if let Some(cfg) = cfg
                 && mid_price > 0.0
@@ -1646,6 +1667,10 @@ impl BacktestEngine {
                     .mark_cache
                     .get(inst)
                     .map(|m| m.as_f64())
+                    // 0.19.0:mark 缺失时优先用**该 instrument 自己本 bar 的 mid_price**,
+                    // 而不是所有 instrument 共用末 leg 的标量 `fallback_mark` ——
+                    // 多品种共享账户下后者会把 A 品种持仓用 B 品种价格估值,NAV/PnL 失真。
+                    .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
                     .unwrap_or(fallback_mark);
                 pos.quantity * mark
             })

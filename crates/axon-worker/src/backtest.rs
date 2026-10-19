@@ -971,4 +971,60 @@ mod tests {
         assert_eq!(eth_decisions, 2, "ETH 只应在有真实 bar 的网格点决策");
         assert_eq!(result.bar_nav_curve.len(), N);
     }
+
+    /// PnL parity（关键 invariant）：共享账户无资金约束时，`run_multi` 的 `total_pnl`
+    /// 必须等于各品种**独立跑** `run()` 的 `total_pnl` 之和。
+    ///
+    /// 为什么必须断言这条：`total_pnl = final_nav - initial_cash`，而 `final_nav` 取自
+    /// `bar_nav_curve` 末帧（engine `build_result`）。一旦盯市估值把某品种的持仓用
+    /// 另一品种的价格折算，PnL 会整体失真，但 **fills / fees / 终态持仓数量仍然正确**
+    /// —— 只看撮合结果查不出这个 bug（0.19.0 修的就是 `compute_nav` 的标量 fallback）。
+    ///
+    /// 用恒定价格（step = 0）使两品种名义价值为常量，误差不随网格点漂移。
+    #[tokio::test]
+    async fn run_multi_pnl_matches_sum_of_independent_runs() {
+        const N: usize = 3;
+        const BTC_PX: f64 = 100.0;
+        const ETH_PX: f64 = 20.0;
+        let btc = make_bars_from(BTC_PX, 0.0, N);
+        let eth = make_bars_from(ETH_PX, 0.0, N);
+
+        // -- 独立：两个单品种 run() --
+        let mut r_btc = BacktestRunner::simple(100_000.0);
+        r_btc.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        let btc_states = BTreeMap::from([("BTC/USDT".to_string(), vec![make_state(); N])]);
+        let solo_btc = r_btc.run(&btc, &btc_states, &BTreeMap::new()).await;
+
+        let mut r_eth = BacktestRunner::simple(100_000.0);
+        r_eth.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+        let eth_states = BTreeMap::from([("ETH/USDT".to_string(), vec![make_state(); N])]);
+        let solo_eth = r_eth.run(&eth, &eth_states, &BTreeMap::new()).await;
+
+        // -- 共享：一个 run_multi --
+        let mut bars_by_symbol: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
+        bars_by_symbol.insert("BTC/USDT".into(), btc.into_iter().map(Some).collect());
+        bars_by_symbol.insert("ETH/USDT".into(), eth.into_iter().map(Some).collect());
+        let states: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::from([
+            ("BTC/USDT".to_string(), vec![make_state(); N]),
+            ("ETH/USDT".to_string(), vec![make_state(); N]),
+        ]);
+
+        let mut r_multi = BacktestRunner::simple(100_000.0);
+        r_multi.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        r_multi.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+        let shared = r_multi
+            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .await;
+
+        let expected = solo_btc.total_pnl + solo_eth.total_pnl;
+        assert!(
+            (shared.total_pnl - expected).abs() < 1e-6,
+            "run_multi total_pnl {} 与独立之和 {} 不一致（差 {}）；\
+             差值若约等于 某品种持仓量×(末 leg 价格−自身价格)，说明 compute_nav \
+             的 fallback 又把某品种持仓用别的品种价格估值了",
+            shared.total_pnl,
+            expected,
+            shared.total_pnl - expected
+        );
+    }
 }
