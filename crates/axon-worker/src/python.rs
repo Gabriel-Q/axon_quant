@@ -144,6 +144,8 @@ impl PyBacktestResult {
             d.set_item("net_quantity", tr.net_quantity as f64 / 1e6)?;
             d.set_item("entry_price", tr.entry_price as f64 / 1e6)?;
             d.set_item("entry_time_ns", tr.entry_time_ns)?;
+            // 共享资金池模式需按品种拆分成交，故补 instrument（同 fills_detail 口径）
+            d.set_item("instrument", instrument_to_tuple(py, &tr.instrument)?)?;
             list.append(d)?;
         }
         Ok(list)
@@ -395,6 +397,94 @@ impl PyBacktestRunner {
         let result = self
             .runtime
             .block_on(runner.run(&rust_bars, &states, &funding));
+
+        Ok((&result).into())
+    }
+
+    /// 多品种共享账户回测（共享资金池模式）
+    ///
+    /// - `bars_by_symbol`: `dict[str, list[dict | None]]`，各 symbol 的**等长**逐网格点
+    ///   bar 列表；`None` 表示该网格点无真实 bar（价格由 Rust 侧前向填充参与盯市，
+    ///   但不触发策略决策）
+    /// - `states_by_symbol` / `funding_by_symbol`: 语义同 `run`
+    /// - `capital_budget`: `float | None`，资金约束预算（`initial_cash × leverage`）；
+    ///   `None` 表示不启用约束
+    #[pyo3(signature = (bars_by_symbol, states_by_symbol=None, funding_by_symbol=None, capital_budget=None))]
+    fn run_multi(
+        &self,
+        bars_by_symbol: &Bound<'_, PyDict>,
+        states_by_symbol: Option<Bound<'_, PyDict>>,
+        funding_by_symbol: Option<Bound<'_, PyDict>>,
+        capital_budget: Option<f64>,
+    ) -> PyResult<PyBacktestResult> {
+        // 1) dict[str, list[dict|None]] → BTreeMap<String, Vec<Option<Bar>>>
+        let mut bars_map: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
+        for (k, v) in bars_by_symbol.iter() {
+            let key: String = k.extract()?;
+            let items: Vec<Bound<'_, PyAny>> = v.extract()?;
+            let mut per_grid: Vec<Option<Bar>> = Vec::with_capacity(items.len());
+            for it in items.iter() {
+                if it.is_none() {
+                    per_grid.push(None);
+                } else {
+                    per_grid.push(Some(dict_to_bar(it.cast::<PyDict>()?)?));
+                }
+            }
+            bars_map.insert(key, per_grid);
+        }
+        if bars_map.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "bars_by_symbol 不能为空",
+            ));
+        }
+        let grid_len = bars_map.values().map(|v| v.len()).max().unwrap_or(0);
+
+        let py = bars_by_symbol.py();
+        let json_mod = py.import("json")?;
+
+        // 2) states_by_symbol（逐 bar；长度不齐时按网格长度补齐「每 bar 同值」）
+        let states: BTreeMap<String, Vec<serde_json::Value>> = match states_by_symbol {
+            Some(d) => {
+                let mut m = BTreeMap::new();
+                for (k, v) in d.iter() {
+                    let key: String = k.extract()?;
+                    let list = if v.is_instance_of::<PyList>() {
+                        let items: Vec<Bound<'_, PyAny>> = v.extract()?;
+                        items
+                            .iter()
+                            .map(|it| dict_to_json_value(&json_mod, it))
+                            .collect::<PyResult<Vec<_>>>()?
+                    } else {
+                        vec![dict_to_json_value(&json_mod, &v)?; grid_len]
+                    };
+                    m.insert(key, list);
+                }
+                m
+            }
+            None => BTreeMap::new(),
+        };
+
+        // 3) funding_by_symbol（同 run）
+        let funding: BTreeMap<String, BTreeMap<i64, (f64, f64)>> = match funding_by_symbol {
+            Some(d) => {
+                let mut m = BTreeMap::new();
+                for (k, v) in d.iter() {
+                    let key: String = k.extract()?;
+                    let sched: BTreeMap<i64, (f64, f64)> = v.extract()?;
+                    m.insert(key, sched);
+                }
+                m
+            }
+            None => BTreeMap::new(),
+        };
+
+        // 4) block_on 执行 async 回测
+        let runner = self.inner.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("BacktestRunner lock 失败: {e}"))
+        })?;
+        let result =
+            self.runtime
+                .block_on(runner.run_multi(&bars_map, &states, &funding, capital_budget));
 
         Ok((&result).into())
     }

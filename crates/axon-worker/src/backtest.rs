@@ -340,6 +340,264 @@ impl BacktestRunner {
             n_strategies: self.strategies.len() as u32,
         }
     }
+
+    /// 多品种共享账户回测入口（共享资金池模式）
+    ///
+    /// 与 [`run`](Self::run) 的区别：`run` 只接受一条 bar 序列，所有 instrument
+    /// 共用同一 `bar.close` 作为 mid_price；本方法接受**按网格对齐**的 per-symbol
+    /// bar 序列，每个 instrument 用各自价格参与 `begin_bar_multi`，所有策略共用
+    /// 同一个 `BacktestEngine`（同一笔 initial_cash），即「多品种共享资金池」。
+    ///
+    /// # 参数
+    /// - `bars_by_symbol`：每个 symbol 的**等长**逐网格点 bar 列表。`None` 表示该
+    ///   symbol 在该网格点无真实 bar：价格按前向填充参与盯市，但不触发策略决策。
+    ///   所有向量必须等长，且每个下标至少有一个 `Some`（网格由调用方取并集保证）
+    /// - `states_by_symbol`：逐 bar state（下标与 `bars_by_symbol` 对齐）
+    /// - `funding_by_symbol`：资金费查找表（键为纳秒时间戳，语义同 `run`）
+    /// - `capital_budget`：资金约束预算（调用方传 `initial_cash × leverage`）。
+    ///   `Some(b)` 时，每个网格点汇总全部 instrument 的目标名义价值，超过 `b`
+    ///   则对所有目标按同一比例缩减，保证「总名义敞口 ≤ b」
+    ///
+    /// # 与 `run` 的语义差异（仅在启用共享模式时）
+    /// `Hold` 决策沿用**上一次已生效（可能已被约束缩放）**的目标，而不是策略
+    /// 自报值——否则约束缩放后会被下一次 hold 复原，产生反复调仓抖动。
+    ///
+    /// ponytail: 约束预算静态（不随净值浮动），升级路径是引擎暴露回测中途 NAV
+    /// 后改用实时权益；当前引擎 `compute_nav` 私有，无中途查询接口。
+    pub async fn run_multi(
+        &self,
+        bars_by_symbol: &BTreeMap<String, Vec<Option<Bar>>>,
+        states_by_symbol: &BTreeMap<String, Vec<serde_json::Value>>,
+        funding_by_symbol: &BTreeMap<String, BTreeMap<i64, (f64, f64)>>,
+        capital_budget: Option<f64>,
+    ) -> BacktestResult {
+        // 网格长度：调用方保证所有 symbol 等长
+        let grid_len = bars_by_symbol.values().map(|v| v.len()).max().unwrap_or(0);
+        assert!(grid_len > 0, "bars_by_symbol must not be empty");
+        for (sym, v) in bars_by_symbol {
+            assert_eq!(v.len(), grid_len, "bars_by_symbol[{sym}] 长度不一致");
+        }
+
+        let initial_cash = self.initial_cash;
+
+        // 1) 收集策略涉及的所有 symbol（去重）
+        let unique_symbols: Vec<String> = {
+            let mut set = BTreeMap::new();
+            for s in &self.strategies {
+                set.entry(s.symbol().to_string()).or_insert_with(|| ());
+            }
+            set.into_keys().collect()
+        };
+
+        // 2) 为每个 symbol 预构造 Instrument
+        let instruments: BTreeMap<String, Instrument> = unique_symbols
+            .iter()
+            .map(|sym| (sym.clone(), self.make_instrument(sym)))
+            .collect();
+
+        // 3) 构造 BacktestEngine（单账户：所有 instrument 共享同一笔 initial_cash）
+        let first_ts = unique_symbols
+            .iter()
+            .filter_map(|sym| {
+                bars_by_symbol
+                    .get(sym)
+                    .and_then(|v| v.iter().flatten().next())
+            })
+            .map(|bar| bar.timestamp)
+            .next()
+            .expect("每个网格点至少有一个真实 bar");
+        let mut engine = BacktestEngine::new(
+            BacktestEngineConfig {
+                clock: SimulatedClock::new(first_ts),
+                matching_engine: Box::new(L1MatchingEngine::new()),
+                impact_model: None,
+                initial_cash,
+                fee_config: FeeConfig::default(),
+                force_liquidate: self.force_liquidate,
+            },
+            EventQueue::new(),
+        );
+        // 与 run() 完全一致的撮合配置（parity 常量见模块顶部）
+        engine.with_auto_rebalance(REBALANCE_THRESHOLD);
+        engine.with_seed_liquidity(SEED_HALF_SPREAD, SEED_DEPTH_LEVELS, SEED_SIZE_PER_LEVEL);
+
+        // 4) 逐网格点编排
+        let mut decisions_timeline: Vec<BarDecisionRecord> =
+            Vec::with_capacity(grid_len * self.strategies.len().max(1));
+        // 各 instrument 最近一次真实 bar 的 close（前向填充，用于盯市与名义价值折算）
+        let mut last_price: BTreeMap<String, f64> = BTreeMap::new();
+        // 各 instrument 当前生效的目标数量（Hold 沿用此值，避免约束缩放被复原）
+        let mut effective_targets: BTreeMap<String, f64> = BTreeMap::new();
+
+        for grid_idx in 0..grid_len {
+            // 4a) 本网格点时间戳：取任一真实 bar（网格为并集，必有）
+            let ts = unique_symbols
+                .iter()
+                .filter_map(|sym| bars_by_symbol.get(sym).and_then(|v| v[grid_idx].as_ref()))
+                .map(|bar| bar.timestamp)
+                .next()
+                .expect("每个网格点至少有一个真实 bar");
+            engine.set_clock(ts);
+
+            // 4b) 先更新前向填充价格
+            for sym in &unique_symbols {
+                if let Some(bar) = bars_by_symbol.get(sym).and_then(|v| v[grid_idx].as_ref()) {
+                    last_price.insert(sym.clone(), bar.close.as_f64());
+                }
+            }
+
+            // 4c) begin_bar_multi：只含已有价格的 instrument（尚未上市者不参与）
+            let legs: Vec<(Instrument, f64)> = unique_symbols
+                .iter()
+                .filter_map(|sym| {
+                    let px = *last_price.get(sym)?;
+                    Some((instruments.get(sym)?.clone(), px))
+                })
+                .collect();
+            engine.begin_bar_multi(legs);
+
+            // 4d) 逐策略决策：仅当本网格点该 symbol 有真实 bar
+            for strategy in &self.strategies {
+                let sym = strategy.symbol();
+                let Some(bar) = bars_by_symbol.get(sym).and_then(|v| v[grid_idx].as_ref()) else {
+                    continue;
+                };
+
+                let state: serde_json::Value = states_by_symbol
+                    .get(sym)
+                    .and_then(|v| v.get(grid_idx))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let ctx = BarContext {
+                    symbol: sym,
+                    bar_index: grid_idx as u64,
+                    timestamp_ns: bar.timestamp.nanos as u64,
+                    bar,
+                    state: &state,
+                };
+
+                let decision = strategy.decide(&ctx).await;
+                let decision_for_timeline = match &decision {
+                    Ok(dec) => Ok(dec.clone()),
+                    Err(e) => Err(e.to_string()),
+                };
+                decisions_timeline.push(BarDecisionRecord {
+                    bar_index: grid_idx as u64,
+                    strategy: strategy.name().into(),
+                    symbol: sym.into(),
+                    decision: decision_for_timeline,
+                    bar_close: bar.close.as_f64(),
+                });
+
+                if let Ok(ref dec) = decision {
+                    let target = if dec.action == axon_llm::decision::Action::Hold {
+                        // Hold：沿用上次生效目标（含约束缩放结果），而非策略自报值
+                        *effective_targets.get(sym).unwrap_or(&0.0)
+                    } else {
+                        dec.target_position
+                            .unwrap_or_else(|| action_to_target(dec.action))
+                    };
+                    effective_targets.insert(sym.to_string(), target);
+                }
+            }
+
+            // 4e) 资金约束：总名义敞口 ≤ budget，超出则全部目标同比例缩减
+            if let Some(budget) = capital_budget {
+                let total_notional: f64 = effective_targets
+                    .iter()
+                    .filter_map(|(sym, qty)| last_price.get(sym).map(|px| qty.abs() * px))
+                    .sum();
+                if total_notional > budget && total_notional > 0.0 {
+                    let scale = budget / total_notional;
+                    for qty in effective_targets.values_mut() {
+                        *qty *= scale;
+                    }
+                }
+            }
+
+            // 4f) 写入目标位（引擎下一次 rebalance 用它撮合）
+            for sym in &unique_symbols {
+                let Some(inst) = instruments.get(sym) else {
+                    continue;
+                };
+                let target = *effective_targets.get(sym).unwrap_or(&0.0);
+                engine.set_target_position(inst.clone(), target);
+            }
+
+            // 4g) 显式 rebalance：语义与 run() 完全一致（guarded by bar_id）
+            engine.rebalance_to_target(None);
+
+            // 4h) 资金费结算：仅本网格点有真实 bar 的 symbol
+            let bar_ts_ns = ts.nanos;
+            let mut funding_pushed = false;
+            for sym in &unique_symbols {
+                if bars_by_symbol
+                    .get(sym)
+                    .and_then(|v| v[grid_idx].as_ref())
+                    .is_none()
+                {
+                    continue;
+                }
+                let Some(sched) = funding_by_symbol.get(sym) else {
+                    continue;
+                };
+                let Some(&(rate, mark)) = sched.get(&bar_ts_ns) else {
+                    continue;
+                };
+                if let Some(inst) = instruments.get(sym) {
+                    let fallback = last_price.get(sym).copied().unwrap_or(0.0);
+                    // mark 缺数据时用该品种最近 close 兜底（对齐 run 的 bar.close 兜底）
+                    let mark_price = if mark > 0.0 { mark } else { fallback };
+                    engine.push_funding(inst.clone(), rate, mark_price, ts);
+                    funding_pushed = true;
+                }
+            }
+            if funding_pushed {
+                while engine.pending_events() > 0 {
+                    engine.step();
+                }
+            }
+        }
+
+        // 5) run() 消费 EventQueue + 聚合 RunResult
+        let run_result = engine.run();
+
+        let final_positions: Vec<(Instrument, f64)> = run_result
+            .positions
+            .iter()
+            .map(|(inst, qty)| (inst.clone(), *qty))
+            .collect();
+
+        BacktestResult {
+            events_processed: run_result.events_processed,
+            orders_accepted: run_result.orders_accepted,
+            orders_rejected: run_result.orders_rejected,
+            orders_cancelled: run_result.orders_cancelled,
+            orders_modified: run_result.orders_modified,
+            fills: run_result.fills,
+            total_pnl: run_result.total_pnl,
+            max_drawdown: run_result.max_drawdown,
+            max_drawdown_pct: run_result.max_drawdown_pct,
+            nav_peak: run_result.nav_peak,
+            final_nav: run_result.final_nav,
+            total_fees: run_result.total_fees,
+            total_funding_pnl: run_result.total_funding_pnl,
+            win_rate: run_result.win_rate,
+            sharpe_ratio: run_result.sharpe_ratio,
+            duration_secs: run_result.duration.as_secs_f64(),
+            final_time_ns: run_result.final_time.nanos,
+            decisions_timeline,
+            bar_nav_curve: run_result.bar_nav_curve,
+            equity_curve: run_result.equity_curve,
+            trades: run_result.trades,
+            fills_detail: run_result.fills_detail,
+            rebalances_triggered: run_result.rebalances_triggered,
+            final_positions,
+            n_bars: grid_len as u64,
+            n_strategies: self.strategies.len() as u32,
+        }
+    }
 }
 
 // ── 辅助：Action → target_position 映射 ── //
@@ -557,5 +815,216 @@ mod tests {
         assert_eq!(result.orders_accepted, 0);
         assert_eq!(result.orders_rejected, 0);
         assert_eq!(result.final_nav, 100_000.0);
+    }
+
+    /// 构造指定起价与斜率的 bar 序列（1min 间隔）
+    fn make_bars_from(start_price: f64, step: f64, n: usize) -> Vec<Bar> {
+        (0..n)
+            .map(|i| {
+                let close_f = start_price + i as f64 * step;
+                Bar {
+                    timestamp: Timestamp::from_secs(i as i64 * 60),
+                    open: Price::from_f64(close_f - 0.5),
+                    high: Price::from_f64(close_f + 0.3),
+                    low: Price::from_f64(close_f - 0.8),
+                    close: Price::from_f64(close_f),
+                    volume: Quantity::from_f64(1000.0),
+                }
+            })
+            .collect()
+    }
+
+    /// 不启用资金约束：两个品种按各自价格成交，每笔成交的 instrument 归属正确
+    #[tokio::test]
+    async fn run_multi_two_symbols_uses_per_symbol_prices() {
+        const N: usize = 5;
+        let btc = make_bars_from(100.0, 1.0, N);
+        let eth = make_bars_from(20.0, 0.5, N);
+
+        let mut bars_by_symbol: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
+        bars_by_symbol.insert("BTC/USDT".into(), btc.into_iter().map(Some).collect());
+        bars_by_symbol.insert("ETH/USDT".into(), eth.into_iter().map(Some).collect());
+
+        let mut states: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        states.insert("BTC/USDT".into(), vec![make_state(); N]);
+        states.insert("ETH/USDT".into(), vec![make_state(); N]);
+
+        let mut runner = BacktestRunner::simple(100_000.0);
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+
+        let result = runner
+            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .await;
+
+        assert_eq!(result.n_bars, N as u64);
+        assert_eq!(result.n_strategies, 2);
+        // 两个品种各自成交 → 每笔 fill 明细至少覆盖两个 instrument
+        //
+        // 注：`RuleStrategyImpl` 全程 Buy，不会产生平仓配对，故 `trades`（round-trip）
+        // 为空；改用 `fills_detail`（每笔 fill 均带 instrument）验证跨品种成交归属。
+        let instruments_seen: std::collections::BTreeSet<String> = result
+            .fills_detail
+            .iter()
+            .map(|f| {
+                format!(
+                    "{}/{}",
+                    f.instrument.base().as_str(),
+                    f.instrument.quote().as_str()
+                )
+            })
+            .collect();
+        assert!(
+            instruments_seen.len() >= 2,
+            "expected fills from both instruments, got {instruments_seen:?}"
+        );
+        // 每 bar 一帧
+        assert_eq!(result.bar_nav_curve.len(), N);
+    }
+
+    /// 启用资金约束：两个品种各要 1 单位，价格恒定 → 总名义敞口被缩放到 budget
+    ///
+    /// 注：`RuleStrategyImpl` 在 Buy 时不带 target_position，`run` 语义回退到
+    /// `action_to_target(Buy) = 1.0`（绝对 1 单位）。故两品种名义价值 = 100 + 20 = 120，
+    /// 恒为常量，便于精确断言缩放后总敞口 == budget。
+    #[tokio::test]
+    async fn run_multi_capital_guard_scales_targets() {
+        const N: usize = 3;
+        const BTC_PX: f64 = 100.0;
+        const ETH_PX: f64 = 20.0;
+        // 价格恒定（step = 0），使名义价值与网格点无关，断言可精确到常量
+        let btc = make_bars_from(BTC_PX, 0.0, N);
+        let eth = make_bars_from(ETH_PX, 0.0, N);
+
+        let mut bars_by_symbol: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
+        bars_by_symbol.insert("BTC/USDT".into(), btc.into_iter().map(Some).collect());
+        bars_by_symbol.insert("ETH/USDT".into(), eth.into_iter().map(Some).collect());
+
+        let mut states: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        states.insert("BTC/USDT".into(), vec![make_state(); N]);
+        states.insert("ETH/USDT".into(), vec![make_state(); N]);
+
+        let mut runner = BacktestRunner::simple(1_000.0);
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+
+        // budget = 1.0，远小于两品种原始名义 120 → 必须缩放到总敞口 ≤ 1.0
+        let result = runner
+            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), Some(1.0))
+            .await;
+
+        let final_notional: f64 = result
+            .final_positions
+            .iter()
+            .map(|(inst, qty)| {
+                let px = if inst.base().as_str() == "BTC" {
+                    BTC_PX
+                } else {
+                    ETH_PX
+                };
+                qty.abs() * px
+            })
+            .sum();
+        assert!(
+            final_notional <= 1.0 * 1.01,
+            "final gross notional {final_notional} should be capped by budget 1.0"
+        );
+        assert!(
+            final_notional > 0.5,
+            "guard should scale down, not wipe out positions (got {final_notional})"
+        );
+    }
+
+    /// None 占位：某品种前两根网格点无 bar → 该品种不参与搓合，也不影响另一品种
+    #[tokio::test]
+    async fn run_multi_none_slots_are_forward_filled_not_decided() {
+        const N: usize = 4;
+        let btc = make_bars_from(100.0, 1.0, N);
+        // ETH 只有后两根 bar，前两根用 None 占位（网格 = BTC 的并集）
+        let eth_full = make_bars_from(20.0, 0.5, N);
+
+        let mut bars_by_symbol: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
+        bars_by_symbol.insert("BTC/USDT".into(), btc.into_iter().map(Some).collect());
+        bars_by_symbol.insert(
+            "ETH/USDT".into(),
+            vec![None, None, Some(eth_full[2]), Some(eth_full[3])],
+        );
+
+        let mut states: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        states.insert("BTC/USDT".into(), vec![make_state(); N]);
+        states.insert("ETH/USDT".into(), vec![make_state(); N]);
+
+        let mut runner = BacktestRunner::simple(100_000.0);
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+
+        let result = runner
+            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .await;
+
+        // 决策轨迹仍每 bar 一条（BTC 每 bar 都有真实 bar），ETH 只在后两根出现
+        let eth_decisions = result
+            .decisions_timeline
+            .iter()
+            .filter(|d| d.symbol == "ETH/USDT")
+            .count();
+        assert_eq!(eth_decisions, 2, "ETH 只应在有真实 bar 的网格点决策");
+        assert_eq!(result.bar_nav_curve.len(), N);
+    }
+
+    /// PnL parity（关键 invariant）：共享账户无资金约束时，`run_multi` 的 `total_pnl`
+    /// 必须等于各品种**独立跑** `run()` 的 `total_pnl` 之和。
+    ///
+    /// 为什么必须断言这条：`total_pnl = final_nav - initial_cash`，而 `final_nav` 取自
+    /// `bar_nav_curve` 末帧（engine `build_result`）。一旦盯市估值把某品种的持仓用
+    /// 另一品种的价格折算，PnL 会整体失真，但 **fills / fees / 终态持仓数量仍然正确**
+    /// —— 只看撮合结果查不出这个 bug（0.19.0 修的就是 `compute_nav` 的标量 fallback）。
+    ///
+    /// 用恒定价格（step = 0）使两品种名义价值为常量，误差不随网格点漂移。
+    #[tokio::test]
+    async fn run_multi_pnl_matches_sum_of_independent_runs() {
+        const N: usize = 3;
+        const BTC_PX: f64 = 100.0;
+        const ETH_PX: f64 = 20.0;
+        let btc = make_bars_from(BTC_PX, 0.0, N);
+        let eth = make_bars_from(ETH_PX, 0.0, N);
+
+        // -- 独立：两个单品种 run() --
+        let mut r_btc = BacktestRunner::simple(100_000.0);
+        r_btc.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        let btc_states = BTreeMap::from([("BTC/USDT".to_string(), vec![make_state(); N])]);
+        let solo_btc = r_btc.run(&btc, &btc_states, &BTreeMap::new()).await;
+
+        let mut r_eth = BacktestRunner::simple(100_000.0);
+        r_eth.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+        let eth_states = BTreeMap::from([("ETH/USDT".to_string(), vec![make_state(); N])]);
+        let solo_eth = r_eth.run(&eth, &eth_states, &BTreeMap::new()).await;
+
+        // -- 共享：一个 run_multi --
+        let mut bars_by_symbol: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
+        bars_by_symbol.insert("BTC/USDT".into(), btc.into_iter().map(Some).collect());
+        bars_by_symbol.insert("ETH/USDT".into(), eth.into_iter().map(Some).collect());
+        let states: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::from([
+            ("BTC/USDT".to_string(), vec![make_state(); N]),
+            ("ETH/USDT".to_string(), vec![make_state(); N]),
+        ]);
+
+        let mut r_multi = BacktestRunner::simple(100_000.0);
+        r_multi.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+        r_multi.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
+        let shared = r_multi
+            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .await;
+
+        let expected = solo_btc.total_pnl + solo_eth.total_pnl;
+        assert!(
+            (shared.total_pnl - expected).abs() < 1e-6,
+            "run_multi total_pnl {} 与独立之和 {} 不一致（差 {}）；\
+             差值若约等于 某品种持仓量×(末 leg 价格−自身价格)，说明 compute_nav \
+             的 fallback 又把某品种持仓用别的品种价格估值了",
+            shared.total_pnl,
+            expected,
+            shared.total_pnl - expected
+        );
     }
 }
