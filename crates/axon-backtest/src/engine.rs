@@ -404,6 +404,8 @@ struct PositionState {
     realized_pnl: f64,
     /// 累计开仓手续费
     entry_fee: f64,
+    /// 当前持仓由哪些开仓 fill 构成（状态1起头、状态2追加、平仓时读后清空）
+    open_fill_ids: Vec<u32>,
 }
 
 /// 回测运行时状态(Stage 3 阶段 B 新增,封装在 `BacktestEngine` 内部)
@@ -1452,6 +1454,8 @@ impl BacktestEngine {
         // - `MatchFill.timestamp` 是 Order 创建时的 `taker_created`(wall clock)
         // - 用户的 `Event::OrderSubmitted.timestamp_ns` 是 simulated event time
         // - backtest 报表/审计需要的"事件时间"是后者(`self.config.clock`)
+        // fill_id 取 push 前下标，保证全局唯一且等于 fills_detail 下标
+        let fill_id = self.bt_state.fills_detail.len() as u32;
         self.bt_state.fills_detail.push(FillRecord::new(
             self.config.clock.now(),
             instrument.clone(),
@@ -1460,7 +1464,7 @@ impl BacktestEngine {
             side,
             fill.price,
             fill.quantity,
-            0, // fill_id 占位,真实值由后续改动在 apply_fill 内注入
+            fill_id,
         ));
 
         // ── 2. 6 状态机 ──────────────────────────────
@@ -1488,6 +1492,7 @@ impl BacktestEngine {
                 pos.entry_fee = fee;
                 pos.entry_time_ns = timestamp.nanos;
                 pos.side = Some(side);
+                pos.open_fill_ids = vec![fill_id];
             }
             // (2) 同向加仓 (sign same, p≠0)
             (p, n) if p.signum() == n.signum() && p != 0.0 => {
@@ -1496,9 +1501,12 @@ impl BacktestEngine {
                 pos.avg_cost = (p.abs() * pos.avg_cost + n.abs() * fill_price) / new_qty.abs();
                 pos.quantity = new_qty;
                 pos.entry_fee += fee;
+                pos.open_fill_ids.push(fill_id);
             }
             // (3) 完全平仓 (sign diff, |p|=|n|,容忍 1e-9 浮点误差)
             (p, n) if p.signum() != n.signum() && (p + n).abs() < 1e-9 => {
+                // 读后清空：这批开仓 fill 归属本笔平仓 trade
+                let entry_fill_ids = std::mem::take(&mut pos.open_fill_ids);
                 let close_qty = p.abs();
                 let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
                 pos.realized_pnl += pnl;
@@ -1523,8 +1531,8 @@ impl BacktestEngine {
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
-                    Vec::new(), // entry_fill_ids 占位,后续由 apply_fill 注入
-                    0,          // exit_fill_id 占位
+                    entry_fill_ids,
+                    fill_id,
                 ));
                 // 清仓
                 pos.quantity = 0.0;
@@ -1539,6 +1547,8 @@ impl BacktestEngine {
             // 跟"完全平仓"分支语义重叠;正确语义是"反向 fill 一部分只平一部分"。
             // 终态 `pos.quantity = p + n`,方向同 n,幅值 = |p| - |n|。
             (p, n) if p.signum() != n.signum() && n.abs() < p.abs() => {
+                // 共享归属：不清空，剩余仓位仍由这批开仓 fill 构成
+                let entry_fill_ids = pos.open_fill_ids.clone();
                 let close_qty = n.abs();
                 let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
                 pos.realized_pnl += pnl;
@@ -1564,8 +1574,8 @@ impl BacktestEngine {
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
-                    Vec::new(), // entry_fill_ids 占位,后续由 apply_fill 注入
-                    0,          // exit_fill_id 占位
+                    entry_fill_ids,
+                    fill_id,
                 ));
                 // 留 p+n(同 n 方向,幅值 = |p|-|n|)
                 pos.quantity = p + n;
@@ -1573,6 +1583,8 @@ impl BacktestEngine {
             }
             // (5) 反手 (sign diff, |n| > |p|):平 p + 开反向 (n+p)
             (p, n) if p.signum() != n.signum() && n.abs() > p.abs() => {
+                // 旧仓的开仓 fill 归属本笔旧 trade；本次 fill 同时充当新仓开仓 fill
+                let old_fill_ids = std::mem::take(&mut pos.open_fill_ids);
                 let close_qty = p.abs();
                 let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
                 pos.realized_pnl += pnl;
@@ -1597,8 +1609,8 @@ impl BacktestEngine {
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
-                    Vec::new(), // entry_fill_ids 占位,后续由 apply_fill 注入
-                    0,          // exit_fill_id 占位
+                    old_fill_ids,
+                    fill_id,
                 ));
                 // 开反向 n + p
                 pos.quantity = n + p;
@@ -1607,6 +1619,7 @@ impl BacktestEngine {
                 pos.entry_fee = fee;
                 pos.entry_time_ns = timestamp.nanos;
                 pos.side = Some(side);
+                pos.open_fill_ids = vec![fill_id];
             }
             // 不应到达 — 防御性兜底
             _ => {}
@@ -4794,5 +4807,185 @@ mod tests {
         assert_eq!(result.events_processed, 1);
         assert_eq!(result.orders_accepted, 1, "router 应把单送进 L1 子引擎挂簿");
         assert_eq!(result.fills, 0, "无对手方,无 fill");
+    }
+
+    // ── 0.21.0 新增:apply_fill 维护 open_fill_ids 并写入 trade ─────
+
+    /// 状态 1（开仓）+ 状态 3（全平）：entry_fill_ids=[0], exit_fill_id=1
+    #[test]
+    fn test_apply_fill_tracks_open_fill_ids() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：Sell 挂簿 + Buy 吃单 → 开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1：Buy 挂簿 + Sell 吃单 → 全平
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.fills_detail[0].fill_id, 0);
+        assert_eq!(result.fills_detail[1].fill_id, 1);
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_id, 1);
+    }
+
+    /// 状态 2（同向加仓）：两笔开仓 fill 都进 entry_fill_ids
+    #[test]
+    fn test_apply_fill_same_direction_add_appends_fill_ids() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1：同向加仓到 2
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 2：全平 2
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0, 1]);
+        assert_eq!(result.trades[0].exit_fill_id, 2);
+    }
+
+    /// 状态 4（部分平仓）：两笔平仓 trade 共享同一组开仓 fill ids
+    #[test]
+    fn test_apply_fill_partial_close_shares_entry_fill_ids() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：开多 2
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        // fill 1：部分平 1，剩 1
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        // fill 2：平剩余 1
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 2);
+        // 两笔平仓 trade 共享开仓 fill 0（avg_cost 口径，不做逐手归因）
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_id, 1);
+        assert_eq!(result.trades[1].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[1].exit_fill_id, 2);
+    }
+
+    /// 状态 5（反手）：同一 fill 既是旧 trade 的 exit_fill_id，又是新仓的 open fill
+    #[test]
+    fn test_apply_fill_reversal_fill_spans_both_cycles() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1：Buy 2 挂簿 + Sell 2 吃单 → 平多 1 并反手开空 1
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+        // fill 2：平掉反手后的空头，验证新仓 open fill = 1
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 2);
+        // 旧多头：开仓 fill 0，平仓（反手）fill 1
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_id, 1);
+        // 新空头：开仓 fill 复用反手那笔 fill 1
+        assert_eq!(result.trades[1].entry_fill_ids, vec![1]);
+        assert_eq!(result.trades[1].exit_fill_id, 2);
     }
 }
