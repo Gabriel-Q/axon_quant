@@ -269,6 +269,14 @@ pub struct RunResult {
     /// win rate 等"按 bar 频率"的指标,避免短回测 + 无 fill 时 `equity_curve`
     /// 末帧 = initial_cash 失真。
     pub bar_nav_curve: Vec<(Timestamp, f64)>,
+    /// 0.21.0 新增:每 bar 末 balance 曲线(`(timestamp_ns, balance)`),与 `bar_nav_curve` 逐帧对齐
+    ///
+    /// balance(MT4 口径)= `cash + Σ(quantity × avg_cost)`:
+    /// 开仓/持仓期间不随 mark 波动,只在平仓(已实现盈亏)、手续费、资金费结算时变化。
+    ///
+    /// 与 `bar_nav_curve` 的关系:`nav - balance` 即当前浮盈(未实现 PnL)。
+    /// 调用方把 balance 画成「存款」曲线,净值高于它即浮盈、低于即浮亏。
+    pub bar_balance_curve: Vec<(Timestamp, f64)>,
     /// NAV 历史峰值(用于计算 max_drawdown_pct)
     pub nav_peak: f64,
     /// 最大回撤百分比(`max_drawdown / nav_peak`,0~1)
@@ -328,6 +336,8 @@ impl Default for RunResult {
             equity_curve: Vec::new(),
             // 0.7.1 新增:每 bar 末 NAV 曲线
             bar_nav_curve: Vec::new(),
+            // 0.21.0 新增:每 bar 末 balance 曲线
+            bar_balance_curve: Vec::new(),
             nav_peak: 0.0,
             max_drawdown_pct: 0.0,
             win_rate: 0.0,
@@ -464,6 +474,16 @@ struct BacktestState {
     /// 时间戳为 `begin_bar` 收尾时的 `clock.now()`(bar 末 funding 调度后)。
     /// 若 `mark_cache` 为空,NAV = cash(无未实现 PnL)。
     bar_nav_curve: Vec<(Timestamp, f64)>,
+    /// 0.21.0 新增:每 bar 末 balance 曲线(`(Timestamp, balance)`)
+    ///
+    /// balance(MT4 口径)= `cash + Σ(quantity × avg_cost)`:
+    /// 开仓/持仓期间不随 mark 波动,只在平仓(已实现盈亏)、手续费、资金费结算时变化。
+    ///
+    /// 与 `bar_nav_curve` 的关系:`nav - balance = Σ quantity × (mark - avg_cost)` = 浮盈。
+    /// 前端/报告把 balance 画成「存款」曲线,净值高于它即浮盈、低于即浮亏。
+    ///
+    /// 与 `bar_nav_curve` 由同一次 `sample_bar_nav` 调用采样,两者长度恒等。
+    bar_balance_curve: Vec<(Timestamp, f64)>,
 }
 
 /// Leg 配置(策略目标仓位)
@@ -996,16 +1016,38 @@ impl BacktestEngine {
     fn sample_bar_nav(&mut self, mark_fallback: f64) {
         let ts = self.config.clock.now();
         let nav = self.compute_nav(ts, mark_fallback);
-        if let Some(last) = self.bt_state.bar_nav_curve.last_mut()
-            && last.0 == ts
+        // 0.21.0:balance 与 nav 在同一次调用内采样,保证两条曲线逐帧对齐
+        let balance = self.compute_balance();
+
+        // NAV 侧:同 bar 二次采样时覆盖末帧,避免重复点污染 Sharpe / max_drawdown
+        if self
+            .bt_state
+            .bar_nav_curve
+            .last()
+            .is_some_and(|last| last.0 == ts)
         {
-            last.1 = nav;
-            // 0.8.0 B5:NAV 累加器也维护(覆盖 case 也要重记,确保 calmar 与 bar 末对齐)
-            self.bt_state.trading_metrics.record_nav(nav);
-            return;
+            if let Some(last) = self.bt_state.bar_nav_curve.last_mut() {
+                last.1 = nav;
+            }
+        } else {
+            self.bt_state.bar_nav_curve.push((ts, nav));
         }
-        self.bt_state.bar_nav_curve.push((ts, nav));
-        // 0.8.0 B5:NAV 累加器维护(供 calmar_ratio 用)
+
+        // balance 侧:与 NAV 同规则(同戳覆盖),长度恒等于 bar_nav_curve
+        if self
+            .bt_state
+            .bar_balance_curve
+            .last()
+            .is_some_and(|last| last.0 == ts)
+        {
+            if let Some(last) = self.bt_state.bar_balance_curve.last_mut() {
+                last.1 = balance;
+            }
+        } else {
+            self.bt_state.bar_balance_curve.push((ts, balance));
+        }
+
+        // 0.8.0 B5:NAV 累加器维护(覆盖 case 也要重记,确保 calmar 与 bar 末对齐)
         self.bt_state.trading_metrics.record_nav(nav);
     }
 
@@ -1678,6 +1720,24 @@ impl BacktestEngine {
         self.bt_state.cash + position_value
     }
 
+    /// 0.21.0 新增:按持仓成本口径计算 balance(MT4 语义)
+    ///
+    /// 公式:`balance = cash + Σ(quantity × avg_cost)`
+    ///
+    /// 与 `compute_nav` 的区别:持仓用 **avg_cost**(开仓成本价)而非 mark 估值。
+    /// 因此开仓瞬间 balance 只减少手续费,持仓期间不随价格波动,平仓时按已实现盈亏变化。
+    /// 恒等式:`nav - balance == 未实现 PnL(浮盈)`。
+    fn compute_balance(&self) -> f64 {
+        // cash 已含手续费/资金费/平仓回款;持仓按成本价折算,与 cash 的开仓支出相抵
+        let cost_basis: f64 = self
+            .bt_state
+            .position_states
+            .values()
+            .map(|pos| pos.quantity * pos.avg_cost)
+            .sum();
+        self.bt_state.cash + cost_basis
+    }
+
     /// 0.5.0 新增(Phase C):处理 Funding 结算事件
     ///
     /// 行为:
@@ -2036,6 +2096,8 @@ impl BacktestEngine {
             equity_curve: self.bt_state.equity_curve.clone(),
             // 0.7.1 新增:bar 末 NAV 曲线(每 bar 一帧,供 Sharpe / max_drawdown 重算)
             bar_nav_curve: self.bt_state.bar_nav_curve.clone(),
+            // 0.21.0 新增:bar 末 balance 曲线(每 bar 一帧,与 bar_nav_curve 逐帧对齐)
+            bar_balance_curve: self.bt_state.bar_balance_curve.clone(),
             nav_peak,
             max_drawdown_pct,
             win_rate,
@@ -4289,6 +4351,94 @@ mod tests {
             (nav - 99_994.899_9).abs() < 1.0,
             "bar_nav NAV 应≈99_994.8999(cash 含费 + 持仓按 fallback 估),got {}",
             nav
+        );
+    }
+
+    // ── 0.21.0 新增:bar_balance_curve 存款曲线 ─────────────
+
+    /// 0.21.0:balance(= cash + Σ(qty × avg_cost))与 NAV 同点采样,
+    /// 且恒等式 `nav - balance == 浮盈` 成立。
+    ///
+    /// 场景:以 100 买入 1 BTC(fee 0.001 → 0.1),mark 先等于成本价、后涨到 110。
+    /// - 开仓后:balance = 100000 - 0.1(仅手续费),与成交价无关
+    /// - mark == avg_cost 时:nav == balance(无浮盈)
+    /// - mark 涨到 110:nav 涨 10,balance 不变 ⇒ nav - balance = 10
+    #[test]
+    fn bar_balance_curve_tracks_realized_pnl_only() {
+        let btc_spot = btc_spot_inst();
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // 卖单挂簿(无对手方的前半),买单吃单 → 1 笔 fill @ 100
+        let sell = make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0);
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(sell),
+        ));
+        let buy = make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0);
+        q.push(b.order(Timestamp::from_nanos(2_000), 2, OrderAction::Submitted(buy)));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        // 先消费 fill 事件,保证首个 bar 采样时持仓/手续费已入账
+        engine.run();
+
+        // bar 1:mark = 100(== 开仓均价)⇒ 无浮盈
+        engine.set_clock(Timestamp::from_nanos(1_000_000_000));
+        engine.begin_bar(100.0, btc_spot.clone());
+        let r1 = engine.run();
+
+        assert_eq!(r1.bar_nav_curve.len(), 1, "1 次 begin_bar 应采 1 帧 NAV");
+        assert_eq!(
+            r1.bar_balance_curve.len(),
+            r1.bar_nav_curve.len(),
+            "balance 曲线必须与 bar_nav_curve 逐帧对齐,got {} vs {}",
+            r1.bar_balance_curve.len(),
+            r1.bar_nav_curve.len()
+        );
+        let (_, nav1) = r1.bar_nav_curve[0];
+        let (_, bal1) = r1.bar_balance_curve[0];
+        // 持仓成本(+100)与 cash 支出(-100)抵消,只剩手续费 0.1
+        assert!(
+            (bal1 - 99_999.9).abs() < 1e-6,
+            "开仓后 balance 应 = initial_cash - fee = 99999.9,got {bal1}"
+        );
+        assert!(
+            (nav1 - bal1).abs() < 1e-6,
+            "mark == avg_cost 时应无浮盈,got nav-balance = {}",
+            nav1 - bal1
+        );
+
+        // bar 2:mark 涨到 110 ⇒ 浮盈 10,balance 不动
+        engine.set_clock(Timestamp::from_nanos(2_000_000_000));
+        engine.begin_bar(110.0, btc_spot.clone());
+        let r2 = engine.run();
+
+        assert_eq!(
+            r2.bar_balance_curve.len(),
+            2,
+            "2 次 begin_bar 应采 2 帧 balance"
+        );
+        let (_, nav2) = r2.bar_nav_curve[1];
+        let (_, bal2) = r2.bar_balance_curve[1];
+        assert!(
+            (bal2 - 99_999.9).abs() < 1e-6,
+            "持仓期间 balance 不应随价格变化,got {bal2}"
+        );
+        assert!(
+            (nav2 - bal2 - 10.0).abs() < 1e-6,
+            "mark 110 ⇒ 浮盈应为 10,got {}",
+            nav2 - bal2
+        );
+    }
+
+    /// 0.21.0:未调 begin_bar 时两条曲线都应空(采样点同一来源)。
+    #[test]
+    fn bar_balance_curve_empty_without_begin_bar() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let r = engine.run();
+        assert!(
+            r.bar_balance_curve.is_empty(),
+            "未调 begin_bar 时 balance 曲线应为空"
         );
     }
 
