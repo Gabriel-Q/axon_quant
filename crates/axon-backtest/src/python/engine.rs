@@ -886,6 +886,9 @@ impl PyRunResult {
             // T0.17 新增:开仓均价(f64)与首次开仓时间(纳秒)
             d.set_item("entry_price", tr.entry_price as f64 / 1e6)?;
             d.set_item("entry_time_ns", tr.entry_time_ns)?;
+            // 开仓 fill id 列表(同向加仓多条)与触发平仓的 fill id,供 Python 侧关联 fills_detail
+            d.set_item("entry_fill_ids", tr.entry_fill_ids.clone())?;
+            d.set_item("exit_fill_id", tr.exit_fill_id)?;
             list.append(d)?;
         }
         Ok(list)
@@ -900,7 +903,7 @@ impl PyRunResult {
     /// 适用场景:审计每笔成交、partial fill 分析、按 taker/maker 拆分
     /// 不适用场景:算胜率/夏普(那用 `trades` + `win_rate`/`sharpe_ratio`)
     ///
-    /// 返回 list[dict],每 dict 7 字段:
+    /// 返回 list[dict],每 dict 8 字段:
     /// - `timestamp_ns`:int(fill 时间)
     /// - `instrument`:tuple(`("spot", base, quote)` 或 `("swap", base, quote, settle, contract_size)`)
     /// - `taker_order_id`:int(吃单方)
@@ -908,6 +911,7 @@ impl PyRunResult {
     /// - `taker_side`:str("Buy" / "Sell")
     /// - `price`:float
     /// - `quantity`:float
+    /// - `fill_id`:int(全局唯一,等于本 list 下标;可被 `trades` 的 `entry_fill_ids`/`exit_fill_id` 引用)
     #[getter]
     fn fills_detail<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
@@ -926,6 +930,7 @@ impl PyRunResult {
             )?;
             d.set_item("price", fr.price.as_f64())?;
             d.set_item("quantity", fr.quantity.as_f64())?;
+            d.set_item("fill_id", fr.fill_id)?;
             list.append(d)?;
         }
         Ok(list)
