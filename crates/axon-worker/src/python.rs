@@ -75,6 +75,9 @@ pub struct PyBacktestResult {
     /// 每 bar 末 NAV 曲线（`[(timestamp_ns, nav), ...]`）
     #[pyo3(get)]
     pub bar_nav_curve: Vec<(i64, f64)>,
+    /// 每 bar 末 balance 存款曲线（`[(timestamp_ns, balance), ...]`）
+    #[pyo3(get)]
+    pub bar_balance_curve: Vec<(i64, f64)>,
     /// 稀疏 NAV 曲线（`[(timestamp_ns, nav), ...]`）
     #[pyo3(get)]
     pub equity_curve: Vec<(i64, f64)>,
@@ -113,6 +116,11 @@ impl From<&BacktestResult> for PyBacktestResult {
                 .bar_nav_curve
                 .iter()
                 .map(|(ts, nav)| (ts.nanos, *nav))
+                .collect(),
+            bar_balance_curve: r
+                .bar_balance_curve
+                .iter()
+                .map(|(ts, bal)| (ts.nanos, *bal))
                 .collect(),
             equity_curve: r
                 .equity_curve

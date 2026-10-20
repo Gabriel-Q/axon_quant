@@ -973,6 +973,20 @@ impl PyRunResult {
         Ok(list)
     }
 
+    /// 0.21.0 新增:每 bar 末 balance 存款曲线(`[(timestamp_ns, balance), ...]`)
+    ///
+    /// `balance = cash + Σ(qty × avg_cost)`,与 `bar_nav_curve` 逐帧对齐。
+    /// `bar_nav_curve[i].1 - bar_balance_curve[i].1` 即该帧浮盈（未实现 PnL）。
+    #[getter]
+    fn bar_balance_curve<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for (ts, bal) in &self.inner.bar_balance_curve {
+            let tup = (ts.nanos, *bal);
+            list.append(tup)?;
+        }
+        Ok(list)
+    }
+
     /// NAV 历史峰值(用于 max_drawdown_pct)
     #[getter]
     fn nav_peak(&self) -> f64 {

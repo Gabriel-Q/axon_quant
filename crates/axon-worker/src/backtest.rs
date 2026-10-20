@@ -389,6 +389,7 @@ impl BacktestRunner {
             final_time_ns: run_result.final_time.nanos,
             decisions_timeline,
             bar_nav_curve: run_result.bar_nav_curve,
+            bar_balance_curve: run_result.bar_balance_curve,
             equity_curve: run_result.equity_curve,
             trades: run_result.trades,
             fills_detail: run_result.fills_detail,
@@ -461,6 +462,10 @@ pub struct BacktestResult {
     pub decisions_timeline: Vec<BarDecisionRecord>,
     /// 每 bar 末 mark-to-market NAV 曲线（L1/L2 指标用这个）
     pub bar_nav_curve: Vec<(Timestamp, f64)>,
+    /// 每 bar 末 balance 存款曲线（与 `bar_nav_curve` 逐帧对齐，`(timestamp_ns, balance)`）
+    ///
+    /// `balance = cash + Σ(qty × avg_cost)`；`nav - balance` 即浮盈。
+    pub bar_balance_curve: Vec<(Timestamp, f64)>,
     /// 稀疏 NAV 曲线（fill/funding 事件触发时采样）
     pub equity_curve: Vec<(Timestamp, f64)>,
     /// round-trip 配对交易记录
