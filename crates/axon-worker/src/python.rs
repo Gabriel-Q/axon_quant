@@ -154,6 +154,9 @@ impl PyBacktestResult {
             d.set_item("entry_time_ns", tr.entry_time_ns)?;
             // 共享资金池模式需按品种拆分成交，故补 instrument（同 fills_detail 口径）
             d.set_item("instrument", instrument_to_tuple(py, &tr.instrument)?)?;
+            // fill 关联：开仓 fill id 列表（同向加仓多条）与触发平仓的 fill id
+            d.set_item("entry_fill_ids", tr.entry_fill_ids.clone())?;
+            d.set_item("exit_fill_id", tr.exit_fill_id)?;
             list.append(d)?;
         }
         Ok(list)
@@ -178,6 +181,8 @@ impl PyBacktestResult {
             )?;
             d.set_item("price", fr.price.as_f64())?;
             d.set_item("quantity", fr.quantity.as_f64())?;
+            // fill 全局唯一 id（= fills_detail 下标），供 trades 的 entry_fill_ids/exit_fill_id 关联
+            d.set_item("fill_id", fr.fill_id)?;
             list.append(d)?;
         }
         Ok(list)
