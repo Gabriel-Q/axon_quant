@@ -328,89 +328,20 @@ impl PyBacktestRunner {
 
     /// 执行回测（同步阻塞，内部 block_on async 循环）
     ///
-    /// - `bars`: list[dict]，每个 dict 含 timestamp(ns int)/open/high/low/close/volume
-    /// - `states_by_symbol`: dict[str, dict | list[dict]]；值为 list 时按**逐 bar** 注入
-    ///   （第 i 项对应第 i 根 bar），值为单对象时展开为「每 bar 同值」的便捷用法
-    /// - `funding_by_symbol`: dict[str, dict[int, tuple(rate, mark_price)]]，资金费查找表
-    ///   （键为 bar 纳秒时间戳；命中即入队结算）。现货回测传 None 即可
-    #[pyo3(signature = (bars, states_by_symbol=None, funding_by_symbol=None))]
-    fn run(
-        &self,
-        bars: Vec<Bound<'_, PyDict>>,
-        states_by_symbol: Option<Bound<'_, PyDict>>,
-        funding_by_symbol: Option<Bound<'_, PyDict>>,
-    ) -> PyResult<PyBacktestResult> {
-        if bars.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err("bars 不能为空"));
-        }
-
-        // 1) list[dict] → Vec<Bar>
-        let rust_bars: Vec<Bar> = bars
-            .iter()
-            .map(|d| dict_to_bar(d))
-            .collect::<PyResult<Vec<_>>>()?;
-
-        let py = bars[0].py();
-        let json_mod = py.import("json")?;
-
-        // 2) states_by_symbol → BTreeMap<String, Vec<Value>>（每 bar 一项）
-        let states: BTreeMap<String, Vec<serde_json::Value>> = match states_by_symbol {
-            Some(d) => {
-                let mut m = BTreeMap::new();
-                for (k, v) in d.iter() {
-                    let key: String = k.extract()?;
-                    let list = if v.is_instance_of::<PyList>() {
-                        let items: Vec<Bound<'_, PyAny>> = v.extract()?;
-                        items
-                            .iter()
-                            .map(|it| dict_to_json_value(&json_mod, it))
-                            .collect::<PyResult<Vec<_>>>()?
-                    } else {
-                        // 单对象 → 每 bar 同值
-                        vec![dict_to_json_value(&json_mod, &v)?; rust_bars.len()]
-                    };
-                    m.insert(key, list);
-                }
-                m
-            }
-            None => BTreeMap::new(),
-        };
-
-        // 3) funding_by_symbol → BTreeMap<String, BTreeMap<i64, (f64, f64)>>
-        let funding: BTreeMap<String, BTreeMap<i64, (f64, f64)>> = match funding_by_symbol {
-            Some(d) => {
-                let mut m = BTreeMap::new();
-                for (k, v) in d.iter() {
-                    let key: String = k.extract()?;
-                    let sched: BTreeMap<i64, (f64, f64)> = v.extract()?;
-                    m.insert(key, sched);
-                }
-                m
-            }
-            None => BTreeMap::new(),
-        };
-
-        // 4) block_on 执行 async 回测
-        let runner = self.inner.lock().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("BacktestRunner lock 失败: {e}"))
-        })?;
-        let result = self
-            .runtime
-            .block_on(runner.run(&rust_bars, &states, &funding));
-
-        Ok((&result).into())
-    }
-
-    /// 多品种共享账户回测（共享资金池模式）
+    /// 单品种与多品种共享账户统一走这一条路径：单品种只需传一个 symbol 的完整
+    /// bar 列表（无 `None` 缺口）。
     ///
     /// - `bars_by_symbol`: `dict[str, list[dict | None]]`，各 symbol 的**等长**逐网格点
     ///   bar 列表；`None` 表示该网格点无真实 bar（价格由 Rust 侧前向填充参与盯市，
     ///   但不触发策略决策）
-    /// - `states_by_symbol` / `funding_by_symbol`: 语义同 `run`
+    /// - `states_by_symbol`: dict[str, dict | list[dict]]；值为 list 时按**逐 bar** 注入
+    ///   （第 i 项对应第 i 个网格点），值为单对象时展开为「每 bar 同值」的便捷用法
+    /// - `funding_by_symbol`: dict[str, dict[int, tuple(rate, mark_price)]]，资金费查找表
+    ///   （键为 bar 纳秒时间戳；命中即入队结算）。现货回测传 None 即可
     /// - `capital_budget`: `float | None`，资金约束预算（`initial_cash × leverage`）；
-    ///   `None` 表示不启用约束
+    ///   `None` 表示不启用约束。单品种回测传 None
     #[pyo3(signature = (bars_by_symbol, states_by_symbol=None, funding_by_symbol=None, capital_budget=None))]
-    fn run_multi(
+    fn run(
         &self,
         bars_by_symbol: &Bound<'_, PyDict>,
         states_by_symbol: Option<Bound<'_, PyDict>>,
@@ -464,7 +395,7 @@ impl PyBacktestRunner {
             None => BTreeMap::new(),
         };
 
-        // 3) funding_by_symbol（同 run）
+        // 3) funding_by_symbol → BTreeMap<String, BTreeMap<i64, (f64, f64)>>
         let funding: BTreeMap<String, BTreeMap<i64, (f64, f64)>> = match funding_by_symbol {
             Some(d) => {
                 let mut m = BTreeMap::new();
@@ -484,7 +415,7 @@ impl PyBacktestRunner {
         })?;
         let result =
             self.runtime
-                .block_on(runner.run_multi(&bars_map, &states, &funding, capital_budget));
+                .block_on(runner.run(&bars_map, &states, &funding, capital_budget));
 
         Ok((&result).into())
     }

@@ -142,229 +142,29 @@ impl BacktestRunner {
         self
     }
 
-    /// 全 Rust 原生回测入口
+    /// 回测入口（单品种与多品种共享账户统一走这一条路径）
     ///
-    /// # 参数
-    /// - `bars`: 时间窗口内所有 K 线（必须按时间升序）
-    /// - `states_by_symbol`: 每个 symbol 的**逐 bar** state 列表（第 i 项对应第 i 根 bar；
-    ///   通常承载 `{"features": {...}}` 等因子/上下文，用于逐 bar 注入）
-    /// - `funding_by_symbol`: 每个 symbol 的资金费查找表 `{bar_纳秒时间戳: (rate, mark_price)}`，
-    ///   命中当前 bar 时刻时入队 `push_funding` 并 drain（对齐 QuantCell BacktestLoop）
-    ///
-    /// # 返回
-    /// BacktestResult：决策轨迹 + RunResult 聚合的撮合统计
-    pub async fn run(
-        &self,
-        bars: &[Bar],
-        states_by_symbol: &BTreeMap<String, Vec<serde_json::Value>>,
-        funding_by_symbol: &BTreeMap<String, BTreeMap<i64, (f64, f64)>>,
-    ) -> BacktestResult {
-        assert!(!bars.is_empty(), "bars must not be empty");
-
-        let initial_cash = self.initial_cash;
-
-        // 1) 收集策略涉及的所有 symbol（去重）
-        let unique_symbols: Vec<String> = {
-            let mut set = BTreeMap::new();
-            for s in &self.strategies {
-                set.entry(s.symbol().to_string()).or_insert_with(|| ());
-            }
-            set.into_keys().collect()
-        };
-
-        // 2) 为每个 symbol 预构造 Instrument（复用，避免每 bar 重复 parse）
-        let instruments: BTreeMap<String, Instrument> = unique_symbols
-            .iter()
-            .map(|sym| (sym.clone(), self.make_instrument(sym)))
-            .collect();
-
-        // 3) 构造 BacktestEngine
-        let first_bar_ts = bars[0].timestamp;
-        let mut engine = BacktestEngine::new(
-            BacktestEngineConfig {
-                clock: SimulatedClock::new(first_bar_ts),
-                matching_engine: Box::new(L1MatchingEngine::new()),
-                impact_model: None,
-                initial_cash,
-                fee_config: FeeConfig::default(),
-                force_liquidate: self.force_liquidate,
-            },
-            EventQueue::new(),
-        );
-        // 启用自动 rebalance（begin_bar_multi 末尾会触发）
-        engine.with_auto_rebalance(REBALANCE_THRESHOLD);
-        // 启用虚拟对手盘（L1 撮合引擎默认空 book，没有对手盘 rebalance 发出去没人接）
-        // seed 参数：half_spread 是**绝对价格**（不是 bps），depth_levels 层，每层 size 单位
-        engine.with_seed_liquidity(SEED_HALF_SPREAD, SEED_DEPTH_LEVELS, SEED_SIZE_PER_LEVEL);
-
-        // 4) 逐 bar 编排
-        let mut decisions_timeline: Vec<BarDecisionRecord> =
-            Vec::with_capacity(bars.len() * self.strategies.len().max(1));
-
-        for (bar_idx, bar) in bars.iter().enumerate() {
-            // 4a) 时钟推进到当前 bar（BacktestEngine.config 私有，走公开 setter）
-            engine.set_clock(bar.timestamp);
-
-            // 4b) 先推进 bar：begin_bar_multi → seed_liquidity + 自动 rebalance_to_target。
-            //
-            // 顺序对齐 QuantCell 的 BacktestLoop：每 bar 先 `begin_bar` 再让策略决策，
-            // 因此本 bar 的 rebalance 执行的是**上一 bar**设定的 target
-            // （信号在 bar 末产生、次 bar 成交，避免前视偏差）。若把决策放在 begin_bar
-            // 之前，target 会同 bar 生效，结果与 QuantCell 现有路径不一致。
-            // bar.close 作为 mid_price（L1 撮合引擎的 mark）。
-            let legs: Vec<(Instrument, f64)> = instruments
-                .values()
-                .map(|inst| (inst.clone(), bar.close.as_f64()))
-                .collect();
-            engine.begin_bar_multi(legs);
-
-            // 4c) 所有策略 decide + set_target_position（写入的 target 于下一 bar 成交）
-            for strategy in &self.strategies {
-                // 逐 bar state：第 i 根 bar 取列表第 i 项；缺失则 Null（等价无注入）
-                let state: serde_json::Value = states_by_symbol
-                    .get(strategy.symbol())
-                    .and_then(|v| v.get(bar_idx))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-
-                let ctx = BarContext {
-                    symbol: strategy.symbol(),
-                    bar_index: bar_idx as u64,
-                    // Phase 2 修复：用真实纳秒戳，之前是 RFC3339 字符串长度占位
-                    timestamp_ns: bar.timestamp.nanos as u64,
-                    bar,
-                    state: &state,
-                };
-
-                let decision = strategy.decide(&ctx).await;
-
-                // 先把 Result 转成可序列化的 timeline record（strategy.decide 返回值可能非 Clone）
-                let decision_for_timeline = match &decision {
-                    Ok(dec) => Ok(dec.clone()),
-                    Err(e) => Err(e.to_string()),
-                };
-
-                // 无论决策结果如何都记录轨迹
-                decisions_timeline.push(BarDecisionRecord {
-                    bar_index: bar_idx as u64,
-                    strategy: strategy.name().into(),
-                    symbol: strategy.symbol().into(),
-                    decision: decision_for_timeline,
-                    bar_close: bar.close.as_f64(),
-                });
-
-                // 仅 Ok 时 set_target_position（引擎下一次 rebalance 用它撮合）
-                if let Ok(ref dec) = decision {
-                    // 优先用策略指定的 target_position，否则按 action 推导
-                    let target = dec
-                        .target_position
-                        .unwrap_or_else(|| action_to_target(dec.action));
-                    if let Some(inst) = instruments.get(strategy.symbol()) {
-                        engine.set_target_position(inst.clone(), target);
-                    }
-                }
-            }
-
-            // 4d) 显式 rebalance：对齐 QuantCell BacktestLoop 在 set_target_position
-            //     后的 `engine.rebalance_to_target()` 调用。
-            //
-            // 关键：`rebalance_to_target` 的 bar_id guard **仅在有成交时**才置位
-            // （见 engine.rs `if triggered > 0 { last_rebalance_bar_id = bar_id }`）。
-            // 故 4b 的自动 rebalance 若无成交，本步不会被打断，会用**本 bar 刚写入的
-            // target** 立即调仓（同 bar 生效）；若有成交，本步被 guard 跳过（次 bar 生效）。
-            // 这个"有成交则次 bar、无成交则同 bar"的语义是 QuantCell 现有行为，
-            // 必须复刻才能保证结果一致。
-            engine.rebalance_to_target(None);
-
-            // 4e) 资金费结算：命中当前 bar 时刻的 funding 点时入队 + drain。
-            //     对齐 QuantCell BacktestLoop：push_funding(mark<=0 用 bar.close 兜底)
-            //     后逐个 step() 结算（同 ts 时 fill 先于 funding）。
-            let bar_ts_ns = bar.timestamp.nanos;
-            let mut funding_pushed = false;
-            for sym in &unique_symbols {
-                let Some(sched) = funding_by_symbol.get(sym) else {
-                    continue;
-                };
-                let Some(&(rate, mark)) = sched.get(&bar_ts_ns) else {
-                    continue;
-                };
-                if let Some(inst) = instruments.get(sym) {
-                    let mark_price = if mark > 0.0 { mark } else { bar.close.as_f64() };
-                    engine.push_funding(inst.clone(), rate, mark_price, bar.timestamp);
-                    funding_pushed = true;
-                }
-            }
-            if funding_pushed {
-                while engine.pending_events() > 0 {
-                    engine.step();
-                }
-            }
-        }
-
-        // 5) run() 消费 EventQueue + 聚合 RunResult（队列空时也会 build_result 汇总撮合统计）
-        let run_result = engine.run();
-
-        // 终态持仓快照：Instrument → qty（保持 Instrument 原样，Python 端再转元组）
-        let final_positions: Vec<(Instrument, f64)> = run_result
-            .positions
-            .iter()
-            .map(|(inst, qty)| (inst.clone(), *qty))
-            .collect();
-
-        BacktestResult {
-            events_processed: run_result.events_processed,
-            orders_accepted: run_result.orders_accepted,
-            orders_rejected: run_result.orders_rejected,
-            orders_cancelled: run_result.orders_cancelled,
-            orders_modified: run_result.orders_modified,
-            fills: run_result.fills,
-            total_pnl: run_result.total_pnl,
-            max_drawdown: run_result.max_drawdown,
-            max_drawdown_pct: run_result.max_drawdown_pct,
-            nav_peak: run_result.nav_peak,
-            final_nav: run_result.final_nav,
-            total_fees: run_result.total_fees,
-            total_funding_pnl: run_result.total_funding_pnl,
-            win_rate: run_result.win_rate,
-            sharpe_ratio: run_result.sharpe_ratio,
-            duration_secs: run_result.duration.as_secs_f64(),
-            final_time_ns: run_result.final_time.nanos,
-            decisions_timeline,
-            bar_nav_curve: run_result.bar_nav_curve,
-            equity_curve: run_result.equity_curve,
-            trades: run_result.trades,
-            fills_detail: run_result.fills_detail,
-            rebalances_triggered: run_result.rebalances_triggered,
-            final_positions,
-            n_bars: bars.len() as u64,
-            n_strategies: self.strategies.len() as u32,
-        }
-    }
-
-    /// 多品种共享账户回测入口（共享资金池模式）
-    ///
-    /// 与 [`run`](Self::run) 的区别：`run` 只接受一条 bar 序列，所有 instrument
-    /// 共用同一 `bar.close` 作为 mid_price；本方法接受**按网格对齐**的 per-symbol
-    /// bar 序列，每个 instrument 用各自价格参与 `begin_bar_multi`，所有策略共用
-    /// 同一个 `BacktestEngine`（同一笔 initial_cash），即「多品种共享资金池」。
+    /// 接受**按网格对齐**的 per-symbol bar 序列，每个 instrument 用各自价格参与
+    /// `begin_bar_multi`，所有策略共用同一个 `BacktestEngine`（同一笔 initial_cash）。
+    /// 单品种回测只需传一个 symbol 的完整 bar 列表（无 `None` 缺口）。
     ///
     /// # 参数
     /// - `bars_by_symbol`：每个 symbol 的**等长**逐网格点 bar 列表。`None` 表示该
     ///   symbol 在该网格点无真实 bar：价格按前向填充参与盯市，但不触发策略决策。
     ///   所有向量必须等长，且每个下标至少有一个 `Some`（网格由调用方取并集保证）
     /// - `states_by_symbol`：逐 bar state（下标与 `bars_by_symbol` 对齐）
-    /// - `funding_by_symbol`：资金费查找表（键为纳秒时间戳，语义同 `run`）
+    /// - `funding_by_symbol`：资金费查找表（键为纳秒时间戳）
     /// - `capital_budget`：资金约束预算（调用方传 `initial_cash × leverage`）。
     ///   `Some(b)` 时，每个网格点汇总全部 instrument 的目标名义价值，超过 `b`
-    ///   则对所有目标按同一比例缩减，保证「总名义敞口 ≤ b」
+    ///   则对所有目标按同一比例缩减，保证「总名义敞口 ≤ b」。单品种传 `None`
     ///
-    /// # 与 `run` 的语义差异（仅在启用共享模式时）
+    /// # Hold 语义
     /// `Hold` 决策沿用**上一次已生效（可能已被约束缩放）**的目标，而不是策略
     /// 自报值——否则约束缩放后会被下一次 hold 复原，产生反复调仓抖动。
     ///
     /// ponytail: 约束预算静态（不随净值浮动），升级路径是引擎暴露回测中途 NAV
     /// 后改用实时权益；当前引擎 `compute_nav` 私有，无中途查询接口。
-    pub async fn run_multi(
+    pub async fn run(
         &self,
         bars_by_symbol: &BTreeMap<String, Vec<Option<Bar>>>,
         states_by_symbol: &BTreeMap<String, Vec<serde_json::Value>>,
@@ -765,10 +565,16 @@ mod tests {
         state_by_symbol.insert("BTC/USDT".into(), vec![make_state(); bars.len()]);
         let strategy = Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT"));
 
-        // 2) 跑 BacktestRunner
+        // 2) 跑 BacktestRunner（单品种：包装成单 symbol 的网格，无缺口）
         let mut runner = BacktestRunner::simple(100_000.0);
         runner.add_strategy(strategy);
-        let result = runner.run(&bars, &state_by_symbol, &BTreeMap::new()).await;
+        let bars_by_symbol = BTreeMap::from([(
+            "BTC/USDT".to_string(),
+            bars.iter().cloned().map(Some).collect::<Vec<_>>(),
+        )]);
+        let result = runner
+            .run(&bars_by_symbol, &state_by_symbol, &BTreeMap::new(), None)
+            .await;
 
         // 3) 断言：决策轨迹非空 + 撮合引擎有动作（fills/orders_accepted > 0）
         assert_eq!(result.n_bars, 5);
@@ -808,7 +614,13 @@ mod tests {
 
         let mut runner = BacktestRunner::simple(100_000.0);
         runner.add_strategy(strategy);
-        let result = runner.run(&bars, &state_by_symbol, &BTreeMap::new()).await;
+        let bars_by_symbol = BTreeMap::from([(
+            "BTC/USDT".to_string(),
+            bars.iter().cloned().map(Some).collect::<Vec<_>>(),
+        )]);
+        let result = runner
+            .run(&bars_by_symbol, &state_by_symbol, &BTreeMap::new(), None)
+            .await;
 
         // 全 Hold → target 始终 0 → rebalance 无订单 → fills=0, orders_accepted=0
         assert_eq!(result.fills, 0);
@@ -854,7 +666,7 @@ mod tests {
         runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
 
         let result = runner
-            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .run(&bars_by_symbol, &states, &BTreeMap::new(), None)
             .await;
 
         assert_eq!(result.n_bars, N as u64);
@@ -910,7 +722,7 @@ mod tests {
 
         // budget = 1.0，远小于两品种原始名义 120 → 必须缩放到总敞口 ≤ 1.0
         let result = runner
-            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), Some(1.0))
+            .run(&bars_by_symbol, &states, &BTreeMap::new(), Some(1.0))
             .await;
 
         let final_notional: f64 = result
@@ -959,7 +771,7 @@ mod tests {
         runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
 
         let result = runner
-            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .run(&bars_by_symbol, &states, &BTreeMap::new(), None)
             .await;
 
         // 决策轨迹仍每 bar 一条（BTC 每 bar 都有真实 bar），ETH 只在后两根出现
@@ -972,8 +784,8 @@ mod tests {
         assert_eq!(result.bar_nav_curve.len(), N);
     }
 
-    /// PnL parity（关键 invariant）：共享账户无资金约束时，`run_multi` 的 `total_pnl`
-    /// 必须等于各品种**独立跑** `run()` 的 `total_pnl` 之和。
+    /// PnL parity（关键 invariant）：共享账户无资金约束时，多品种共享 `run` 的
+    /// `total_pnl` 必须等于各品种**独立跑** `run` 的 `total_pnl` 之和。
     ///
     /// 为什么必须断言这条：`total_pnl = final_nav - initial_cash`，而 `final_nav` 取自
     /// `bar_nav_curve` 末帧（engine `build_result`）。一旦盯市估值把某品种的持仓用
@@ -989,18 +801,30 @@ mod tests {
         let btc = make_bars_from(BTC_PX, 0.0, N);
         let eth = make_bars_from(ETH_PX, 0.0, N);
 
-        // -- 独立：两个单品种 run() --
+        // -- 独立：两个单品种 run（各自包装成单 symbol 网格）--
         let mut r_btc = BacktestRunner::simple(100_000.0);
         r_btc.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
         let btc_states = BTreeMap::from([("BTC/USDT".to_string(), vec![make_state(); N])]);
-        let solo_btc = r_btc.run(&btc, &btc_states, &BTreeMap::new()).await;
+        let btc_solo_bars = BTreeMap::from([(
+            "BTC/USDT".to_string(),
+            btc.iter().cloned().map(Some).collect::<Vec<_>>(),
+        )]);
+        let solo_btc = r_btc
+            .run(&btc_solo_bars, &btc_states, &BTreeMap::new(), None)
+            .await;
 
         let mut r_eth = BacktestRunner::simple(100_000.0);
         r_eth.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
         let eth_states = BTreeMap::from([("ETH/USDT".to_string(), vec![make_state(); N])]);
-        let solo_eth = r_eth.run(&eth, &eth_states, &BTreeMap::new()).await;
+        let eth_solo_bars = BTreeMap::from([(
+            "ETH/USDT".to_string(),
+            eth.iter().cloned().map(Some).collect::<Vec<_>>(),
+        )]);
+        let solo_eth = r_eth
+            .run(&eth_solo_bars, &eth_states, &BTreeMap::new(), None)
+            .await;
 
-        // -- 共享：一个 run_multi --
+        // -- 共享：一个多品种 run --
         let mut bars_by_symbol: BTreeMap<String, Vec<Option<Bar>>> = BTreeMap::new();
         bars_by_symbol.insert("BTC/USDT".into(), btc.into_iter().map(Some).collect());
         bars_by_symbol.insert("ETH/USDT".into(), eth.into_iter().map(Some).collect());
@@ -1013,7 +837,7 @@ mod tests {
         r_multi.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
         r_multi.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "ETH/USDT")));
         let shared = r_multi
-            .run_multi(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .run(&bars_by_symbol, &states, &BTreeMap::new(), None)
             .await;
 
         let expected = solo_btc.total_pnl + solo_eth.total_pnl;
