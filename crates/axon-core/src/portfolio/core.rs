@@ -228,6 +228,9 @@ impl Portfolio {
             // 实盘 Position 未跟踪 entry_time_ns,传 0;entry_price 取平仓前的 avg_cost
             (old_cost * 1_000_000.0) as i64,
             0,
+            // 实盘路径没有 fills_detail,无法建立 fill 关联,传空
+            Vec::new(),
+            0,
         ));
 
         Ok(())

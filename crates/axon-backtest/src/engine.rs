@@ -1460,6 +1460,7 @@ impl BacktestEngine {
             side,
             fill.price,
             fill.quantity,
+            0, // fill_id 占位,真实值由后续改动在 apply_fill 内注入
         ));
 
         // ── 2. 6 状态机 ──────────────────────────────
@@ -1522,6 +1523,8 @@ impl BacktestEngine {
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
+                    Vec::new(), // entry_fill_ids 占位,后续由 apply_fill 注入
+                    0,          // exit_fill_id 占位
                 ));
                 // 清仓
                 pos.quantity = 0.0;
@@ -1561,6 +1564,8 @@ impl BacktestEngine {
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
+                    Vec::new(), // entry_fill_ids 占位,后续由 apply_fill 注入
+                    0,          // exit_fill_id 占位
                 ));
                 // 留 p+n(同 n 方向,幅值 = |p|-|n|)
                 pos.quantity = p + n;
@@ -1592,6 +1597,8 @@ impl BacktestEngine {
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
+                    Vec::new(), // entry_fill_ids 占位,后续由 apply_fill 注入
+                    0,          // exit_fill_id 占位
                 ));
                 // 开反向 n + p
                 pos.quantity = n + p;

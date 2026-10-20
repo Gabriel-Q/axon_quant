@@ -219,6 +219,7 @@ fn fill_record_turnover_helper() {
         Side::Buy,
         Price::from_f64(100.0),
         Quantity::from_f64(0.5),
+        0, // turnover 助手测试不关心 fill 关联
     );
     assert!(
         (fr.turnover() - 50.0).abs() < 1e-9,
