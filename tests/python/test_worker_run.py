@@ -1,4 +1,4 @@
-"""BacktestRunner.run_multi 绑定层行为验证（共享资金池路径）。"""
+"""BacktestRunner.run 绑定层行为验证（统一回测路径：单品种 + 共享资金池）。"""
 
 from axon_quant import worker
 
@@ -31,7 +31,7 @@ class AlternatingStrategy:
         return {"action_type": "sell", "confidence": 0.8, "target_position": -100.0}
 
 
-def test_run_multi_aligned_bars_returns_result():
+def test_run_aligned_bars_returns_result():
     n = 6
     bars_by_symbol = {
         "BTC/USDT": _bars(100.0, 1.0, n),
@@ -41,12 +41,12 @@ def test_run_multi_aligned_bars_returns_result():
     runner.add_strategy(AlternatingStrategy("BTC/USDT"), symbol="BTC/USDT")
     runner.add_strategy(AlternatingStrategy("ETH/USDT"), symbol="ETH/USDT")
 
-    result = runner.run_multi(bars_by_symbol=bars_by_symbol)
+    result = runner.run(bars_by_symbol=bars_by_symbol)
     assert result.n_bars == n
     assert result.n_strategies == 2
 
 
-def test_run_multi_none_slot_supported():
+def test_run_none_slot_supported():
     n = 6
     bars_by_symbol = {
         "BTC/USDT": _bars(100.0, 1.0, n),
@@ -57,7 +57,7 @@ def test_run_multi_none_slot_supported():
     runner.add_strategy(AlternatingStrategy("BTC/USDT"), symbol="BTC/USDT")
     runner.add_strategy(AlternatingStrategy("ETH/USDT"), symbol="ETH/USDT")
 
-    result = runner.run_multi(bars_by_symbol=bars_by_symbol)
+    result = runner.run(bars_by_symbol=bars_by_symbol)
     assert result.n_bars == n
 
 
@@ -70,7 +70,8 @@ def test_trades_expose_instrument():
     runner = worker.BacktestRunner(initial_cash=100_000.0, force_liquidate=True)
     runner.add_strategy(AlternatingStrategy("BTC/USDT"), symbol="BTC/USDT")
 
-    result = runner.run(bars=_bars(100.0, 1.0, n))
+    # 单品种：包装成单 symbol 的网格（无 None 缺口）
+    result = runner.run(bars_by_symbol={"BTC/USDT": _bars(100.0, 1.0, n)})
 
     # 每个 fill 明细必然带 instrument（既有行为，作为兜底断言）
     for fr in result.fills_detail:
