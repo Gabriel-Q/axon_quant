@@ -486,6 +486,14 @@ struct BacktestState {
     ///
     /// 与 `bar_nav_curve` 由同一次 `sample_bar_nav` 调用采样,两者长度恒等。
     bar_balance_curve: Vec<(Timestamp, f64)>,
+    /// 逐仓子账户保证金余额(`cross` / 未启用保证金时为空)
+    ///
+    /// 划转只在 `cash ↔ isolated` 之间搬运,对 NAV 中性;强平减仓后按剩余名义
+    /// 释放多余保证金,避免下一 bar 再次判定爆仓(连锁误强平)。
+    ///
+    /// 空账本时 `compute_nav` / `compute_balance` 的 `Σ isolated` 为 0.0,
+    /// 与旧公式逐位一致(浮点加 0.0 是精确操作)。
+    isolated: HashMap<Instrument, f64>,
 }
 
 /// Leg 配置(策略目标仓位)
@@ -1198,6 +1206,54 @@ impl BacktestEngine {
             .unwrap_or(0.0)
     }
 
+    /// 逐仓:从主账户划入子账户保证金(NAV 中性)
+    ///
+    /// 只搬运 `cash → isolated`,不动持仓与已实现盈亏,所以划转前后 NAV 不变。
+    /// 调用方(编排层)负责按 `名义 / leverage` 决定划入多少。
+    pub fn deposit_isolated(&mut self, instrument: &Instrument, margin: f64) {
+        if margin <= 0.0 {
+            return;
+        }
+        self.bt_state.cash -= margin;
+        *self
+            .bt_state
+            .isolated
+            .entry(instrument.clone())
+            .or_insert(0.0) += margin;
+    }
+
+    /// 逐仓:子账户多余保证金释放回主账户(NAV 中性)
+    ///
+    /// `amount` 会被夹到当前余额,不会把子账户扣成负数;余额清零时移除条目。
+    pub fn release_isolated(&mut self, instrument: &Instrument, amount: f64) {
+        let cur = self
+            .bt_state
+            .isolated
+            .get(instrument)
+            .copied()
+            .unwrap_or(0.0);
+        let release = amount.clamp(0.0, cur);
+        if release <= 0.0 {
+            return;
+        }
+        self.bt_state.cash += release;
+        let left = cur - release;
+        if left <= 1e-12 {
+            self.bt_state.isolated.remove(instrument);
+        } else {
+            self.bt_state.isolated.insert(instrument.clone(), left);
+        }
+    }
+
+    /// 逐仓子账户余额(不存在时 0)
+    pub fn isolated_balance(&self, instrument: &Instrument) -> f64 {
+        self.bt_state
+            .isolated
+            .get(instrument)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
     /// 单步处理一个事件：返回处理后的事件统计（用于单元测试与步进模式）
     pub fn step(&mut self) -> Option<RunStats> {
         let event = self.event_queue.next()?;
@@ -1713,7 +1769,9 @@ impl BacktestEngine {
 
     /// Phase B 新增(0.5.0):按 instrument 各自的 `mark_cache` 价计算 mark-to-market NAV
     ///
-    /// 公式:`NAV = cash + Σ(quantity[instrument] × mark[instrument])`
+    /// 公式:`NAV = cash + Σ isolated + Σ(quantity[instrument] × mark[instrument])`
+    /// - 逐仓子账户余额是账户资产的一部分(划转只在 cash ↔ isolated 间搬运)
+    /// - 空账本时 `Σ isolated = 0.0`,与旧公式逐位一致
     /// - `mark_cache[instrument]` 若有,用缓存的 mark 价
     /// - 若无,**fallback_mark** 给定(通常是本次 fill_price,旧场景无 mark 数据)
     /// - 既无 mark 也无 fallback 的 instrument 用其 `avg_cost` 占位(避免
@@ -1737,16 +1795,20 @@ impl BacktestEngine {
                 pos.quantity * mark
             })
             .sum();
-        self.bt_state.cash + position_value
+        let isolated_total: f64 = self.bt_state.isolated.values().sum();
+        self.bt_state.cash + isolated_total + position_value
     }
 
     /// 0.21.0 新增:按持仓成本口径计算 balance(MT4 语义)
     ///
-    /// 公式:`balance = cash + Σ(quantity × avg_cost)`
+    /// 公式:`balance = cash + Σ isolated + Σ(quantity × avg_cost)`
     ///
     /// 与 `compute_nav` 的区别:持仓用 **avg_cost**(开仓成本价)而非 mark 估值。
     /// 因此开仓瞬间 balance 只减少手续费,持仓期间不随价格波动,平仓时按已实现盈亏变化。
     /// 恒等式:`nav - balance == 未实现 PnL(浮盈)`。
+    ///
+    /// 这里同样加回 `Σ isolated`:否则逐仓划转会让 balance 凭空少一截,
+    /// `nav - balance` 的恒等式立刻被破坏。空账本时结果与旧公式逐位一致。
     fn compute_balance(&self) -> f64 {
         // cash 已含手续费/资金费/平仓回款;持仓按成本价折算,与 cash 的开仓支出相抵
         let cost_basis: f64 = self
@@ -1755,7 +1817,8 @@ impl BacktestEngine {
             .values()
             .map(|pos| pos.quantity * pos.avg_cost)
             .sum();
-        self.bt_state.cash + cost_basis
+        let isolated_total: f64 = self.bt_state.isolated.values().sum();
+        self.bt_state.cash + isolated_total + cost_basis
     }
 
     /// 0.5.0 新增(Phase C):处理 Funding 结算事件
@@ -4987,5 +5050,44 @@ mod tests {
         // 新空头：开仓 fill 复用反手那笔 fill 1
         assert_eq!(result.trades[1].entry_fill_ids, vec![1]);
         assert_eq!(result.trades[1].exit_fill_id, 2);
+    }
+
+    // ── 逐仓分账账本(NAV 口径) ─────────────────────────────
+
+    /// 逐仓划转是 `cash ↔ isolated` 的内部搬运,NAV / balance 都必须不变
+    #[test]
+    fn nav_unchanged_by_isolated_transfer() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let inst = btc_spot_inst();
+        engine.begin_bar(100.0, inst.clone());
+        let ts = Timestamp::from_nanos(0);
+        let nav_before = engine.compute_nav(ts, 0.0);
+        let balance_before = engine.compute_balance();
+
+        engine.deposit_isolated(&inst, 1_000.0); // 从 cash 划入子账户
+        assert_eq!(engine.isolated_balance(&inst), 1_000.0);
+        // 划转本身不改 NAV / balance(空账本时公式与旧版逐位一致)
+        assert_eq!(engine.compute_nav(ts, 0.0), nav_before);
+        assert_eq!(engine.compute_balance(), balance_before);
+
+        engine.release_isolated(&inst, 1_000.0); // 释放回 cash
+        assert_eq!(engine.isolated_balance(&inst), 0.0);
+        assert_eq!(engine.compute_nav(ts, 0.0), nav_before);
+        assert_eq!(engine.compute_balance(), balance_before);
+    }
+
+    /// 释放金额超过子账户余额时夹到余额,不产生负余额
+    #[test]
+    fn release_isolated_clamps_to_balance() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let inst = btc_spot_inst();
+        engine.deposit_isolated(&inst, 500.0);
+        let cash_before = engine.bt_state.cash;
+        engine.release_isolated(&inst, 10_000.0);
+        assert_eq!(engine.isolated_balance(&inst), 0.0);
+        assert!((engine.bt_state.cash - (cash_before + 500.0)).abs() < 1e-9);
+        // 余额已清零,再次释放是 no-op
+        engine.release_isolated(&inst, 100.0);
+        assert!((engine.bt_state.cash - (cash_before + 500.0)).abs() < 1e-9);
     }
 }
