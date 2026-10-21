@@ -37,9 +37,12 @@ pub struct TradeRecord {
     /// 构成该持仓的开仓 fill id 列表(同向加仓会追加多条)
     #[serde(default)]
     pub entry_fill_ids: Vec<u32>,
-    /// 触发本次平仓的 fill id(0 表示未知/兼容实盘路径)
+    /// 持仓周期内所有平仓 fill id 列表(FLAT_TO_FLAT 聚合语义)
+    ///
+    /// - 回测路径:Vec 含所有部分平仓 + 最终全平 fill ids
+    /// - 实盘路径:恒为 vec![0]
     #[serde(default)]
-    pub exit_fill_id: u32,
+    pub exit_fill_ids: Vec<u32>,
 }
 
 impl TradeRecord {
@@ -55,7 +58,7 @@ impl TradeRecord {
     /// - `entry_price`:开仓均价(单位 f64 × 1e6,PositionState.avg_cost)
     /// - `entry_time_ns`:首次开仓时间(纳秒,PositionState.entry_time_ns)
     /// - `entry_fill_ids`:构成该持仓的开仓 fill id 列表(同向加仓会追加多条)
-    /// - `exit_fill_id`:触发本次平仓的 fill id(0 表示未知/兼容实盘路径)
+    /// - `exit_fill_ids`:持仓周期内所有平仓 fill ids(回测 FLAT_TO_FLAT 聚合;实盘恒为 vec![0])
     // 构造器字段一对一透传,拆成 builder 反而增加调用点噪声
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -67,7 +70,7 @@ impl TradeRecord {
         entry_price: i64,
         entry_time_ns: i64,
         entry_fill_ids: Vec<u32>,
-        exit_fill_id: u32,
+        exit_fill_ids: Vec<u32>,
     ) -> Self {
         Self {
             trade,
@@ -78,7 +81,7 @@ impl TradeRecord {
             entry_price,
             entry_time_ns,
             entry_fill_ids,
-            exit_fill_id,
+            exit_fill_ids,
         }
     }
 }
@@ -114,7 +117,7 @@ mod tests {
             10_000_000,
             1_000,
             Vec::new(),
-            0,
+            vec![0],
         );
         assert_eq!(rec.realized_pnl, 1_000_000);
         assert_eq!(rec.commission, 100_000);
@@ -141,9 +144,9 @@ mod tests {
             10_000_000,
             1_000,
             vec![0, 1],
-            2,
+            vec![2],
         );
         assert_eq!(rec.entry_fill_ids, vec![0, 1]);
-        assert_eq!(rec.exit_fill_id, 2);
+        assert_eq!(rec.exit_fill_ids, vec![2]);
     }
 }
