@@ -1486,6 +1486,21 @@ impl BacktestEngine {
         side: Side,
         fill: &crate::matching::MatchFill,
     ) {
+        // 先取值再可变借用:否则 `self.config` 与 `&mut self` 同时借用冲突
+        let rate = self.config.fee_config.taker_rate;
+        self.apply_fill_with_fee(instrument, side, fill, rate);
+    }
+
+    /// 按指定费率处理单笔 fill(供强平路径使用:强平费 ≠ taker 费率)
+    ///
+    /// 函数体与原 `apply_fill` 完全一致,只有手续费率由调用方给定。
+    fn apply_fill_with_fee(
+        &mut self,
+        instrument: &Instrument,
+        side: Side,
+        fill: &crate::matching::MatchFill,
+        fee_rate: f64,
+    ) {
         let fill_price = fill.price.as_f64();
         let fill_qty = fill.quantity.as_f64();
         // 成交/持仓/NAV 的审计时间统一用模拟时钟（= 当前 bar 的事件时间）。
@@ -1495,7 +1510,7 @@ impl BacktestEngine {
 
         // ── 1. 现金 + 手续费 ────────────────────────────
         let notional = fill_price * fill_qty;
-        let fee = notional * self.config.fee_config.taker_rate;
+        let fee = notional * fee_rate;
         self.bt_state.fee_accumulator += fee;
         match side {
             Side::Buy => self.bt_state.cash -= notional + fee,
@@ -1964,6 +1979,66 @@ impl BacktestEngine {
     pub fn with_funding_schedule_disable(&mut self, instrument: &Instrument) -> &mut Self {
         self.funding_schedules.remove(instrument);
         self
+    }
+
+    /// 风险减仓:只允许向 0 缩减,永不反手;**绕过** bar_id guard。
+    ///
+    /// 用途:保证金强平。与 `rebalance_to_target` 的区别:
+    /// - 不做阈值判断、不累加 `rebalances_triggered`、不写 `last_rebalance_bar_id`
+    /// - `target_qty` 夹在 `[0, current]`(多仓)或 `[current, 0]`(空仓)
+    /// - 手续费率由调用方给定(强平费 ≠ taker 费率)
+    ///
+    /// 为什么必须绕过 guard:`begin_bar_multi` 在 bar 末已自动调过一次
+    /// `rebalance_to_target`,本 bar 内再调一律 no-op;而强平发生在同一 bar
+    /// 的 funding 之后,若走 rebalance 路径会被 guard 吃掉,导致只判定不执行。
+    ///
+    /// # 返回
+    ///
+    /// 实际产生的 fill 数(0 = 无需减仓或未成交)。
+    pub fn risk_reduce(&mut self, instrument: &Instrument, target_qty: f64, fee_rate: f64) -> u64 {
+        let current = self
+            .bt_state
+            .position_states
+            .get(instrument)
+            .map(|p| p.quantity)
+            .unwrap_or(0.0);
+        if current.abs() < 1e-12 {
+            return 0;
+        }
+        // 只减不增:多仓目标夹到 [0, current],空仓夹到 [current, 0]。
+        // 夹紧而不是拒绝,是因为 tracker 给的是"减到哪个数量",数值可能因
+        // 档位换算略超/略欠;夹紧保证永不反手、永不增仓。
+        let target = if current > 0.0 {
+            target_qty.clamp(0.0, current)
+        } else {
+            target_qty.clamp(current, 0.0)
+        };
+        let delta = target - current;
+        if delta.abs() < 1e-12 {
+            return 0;
+        }
+        let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
+        let order_id = self
+            .rebalance_next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let order = crate::matching::l3::engine_l3::build_leg_order(
+            order_id,
+            instrument,
+            side,
+            OrderType::Market,
+            Quantity::from_f64(delta.abs()),
+            TimeInForce::IOC,
+        );
+        let result = self.config.matching_engine.submit(order);
+        let mut filled = 0u64;
+        for fill in &result.fills {
+            self.stats.orders_accepted += 1;
+            self.stats.fills += 1;
+            self.stats.total_pnl += fill_pnl_delta(fill);
+            self.apply_fill_with_fee(instrument, side, fill, fee_rate);
+            filled += 1;
+        }
+        filled
     }
 
     /// 0.5.0 新增(Phase D):手动触发 rebalance
@@ -5089,5 +5164,63 @@ mod tests {
         // 余额已清零,再次释放是 no-op
         engine.release_isolated(&inst, 100.0);
         assert!((engine.bt_state.cash - (cash_before + 500.0)).abs() < 1e-9);
+    }
+
+    // ── risk_reduce(强平减仓) ─────────────────────────────
+
+    /// 强平减仓必须绕过 bar guard、只减不增、永不反手、不计入 rebalances
+    #[test]
+    fn risk_reduce_bypasses_bar_guard_and_never_flips() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 预挂卖单 1.0 @ 50_000:开仓市价买吃它
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 50_000.0, 1.0);
+        // 预挂买单 1.0 @ 49_990:留在 book 上,给减仓市价卖吃(低于卖价不会先撮合)
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(49_990.0),
+                },
+                Quantity::from_f64(1.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.run();
+        engine.with_auto_rebalance(1e-6);
+        engine.begin_bar(50_000.0, inst.clone()); // bar_id = 1
+        engine.set_target_position(inst.clone(), 1.0);
+        assert_eq!(engine.rebalance_to_target(None), 1);
+        // 同 bar 再 rebalance:被 bar_id guard 拦掉(这正是强平不能走 rebalance 的原因)
+        assert_eq!(engine.rebalance_to_target(None), 0);
+        assert!((engine.get_position(&inst) - 1.0).abs() < 1e-9);
+        let rebalances_before = engine.rebalances_triggered;
+
+        // 目标 -5 会被夹到 0:不允许反手开空
+        let filled = engine.risk_reduce(&inst, -5.0, 0.004);
+        assert_eq!(filled, 1);
+        assert_eq!(engine.get_position(&inst), 0.0);
+        assert_eq!(
+            engine.rebalances_triggered, rebalances_before,
+            "强平减仓不应累加 rebalances_triggered"
+        );
+    }
+
+    /// 无持仓时 risk_reduce 是 no-op
+    #[test]
+    fn risk_reduce_is_noop_without_position() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let inst = btc_spot_inst();
+        engine.begin_bar(100.0, inst.clone());
+        assert_eq!(engine.risk_reduce(&inst, 0.0, 0.004), 0);
+        assert_eq!(engine.risk_reduce(&inst, -1.0, 0.004), 0);
     }
 }
