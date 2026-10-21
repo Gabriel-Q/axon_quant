@@ -2234,11 +2234,14 @@ impl BacktestEngine {
         self.sync_isolated_margins();
         // 1) 快照(不可变借用,函数返回后即释放)
         let snapshot = self.margin_snapshot();
-        // 2) 计划(只读):判定与执行分离,避免判定期间账本被改写
-        let actions = match self.margin.as_ref() {
-            Some(tracker) => tracker.plan(&snapshot),
-            None => return Vec::new(),
-        };
+        // 2) 计划(只读):判定与执行分离,避免判定期间账本被改写。
+        //    这里**不能**在 actions 为空时提前 return：下方穿仓兜底与是否发生
+        //    强平无关，NAV < 0 必须每 bar 修正，否则 final_nav 可以为负。
+        let actions = self
+            .margin
+            .as_ref()
+            .map(|tracker| tracker.plan(&snapshot))
+            .unwrap_or_default();
 
         let timestamp_ns = self.config.clock.now().nanos;
         let mut events = Vec::new();
@@ -5988,5 +5991,89 @@ mod tests {
         engine.begin_bar(99.0, inst.clone());
         let nav_down = engine.nav_for_test();
         assert!((nav_down - 945.0).abs() < 5.0, "nav_down={nav_down}");
+    }
+
+    /// 穿仓兜底与"本 bar 是否有强平动作"无关：NAV 为负一律写零
+    #[test]
+    fn nav_floored_even_without_liquidation_actions() {
+        let mut engine = new_test_engine(100.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0);
+        engine.rebalance_to_target(Some(1e-6));
+        // 极端下跌让 NAV 变负，但仓位已被清空 → 本 bar 没有强平动作
+        engine.begin_bar(1.0, inst.clone());
+        let _ = engine.check_margin();
+        let _ = engine.check_margin();
+        assert!(engine.nav_for_test() >= 0.0);
+        assert!(engine.insurance_fund_loss > 0.0);
+    }
+
+    /// 受控行情：价格 100 → 98.8（-1.2%，120 根），策略恒定 50% 权益名义仓位。
+    ///
+    /// 返回 `(final_nav, total_pnl, 强平事件数, fills)`。
+    fn run_controlled_decline(leverage: f64, margin: bool) -> (f64, f64, usize, u64) {
+        const N: usize = 120;
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        if margin {
+            engine.set_margin_for_test(&inst, leverage, MarginMode::Cross);
+        }
+        for i in 0..N {
+            let px = 100.0 - 0.01 * i as f64;
+            engine.set_clock(Timestamp::from_nanos(i as i64 * 900_000_000_000));
+            engine.begin_bar(px, inst.clone());
+            // 恒定 50% 权益名义仓位（不随杠杆放大，与设计文档受控实验一致）
+            engine.set_target_position(inst.clone(), 0.5 * engine.nav_for_test() / px);
+            engine.rebalance_to_target(Some(1e-12));
+            engine.check_margin();
+        }
+        // 末尾再采样一帧，让 final_nav 反映最后一根 bar 的盯市
+        let px_last = 100.0 - 0.01 * (N - 1) as f64;
+        engine.set_clock(Timestamp::from_nanos(N as i64 * 900_000_000_000));
+        engine.begin_bar(px_last, inst.clone());
+        let result = engine.run();
+        (
+            result.final_nav,
+            result.total_pnl,
+            result.liquidation_events.len(),
+            result.fills,
+        )
+    }
+
+    /// 价格只跌 1.2% 时 20x 全仓不应爆仓，且 final_nav 必须为正
+    #[test]
+    fn controlled_slow_decline_20x_cross_does_not_liquidate() {
+        let (nav20, pnl20, events20, fills20) = run_controlled_decline(20.0, true);
+        println!(
+            "[controlled] 20x cross: pnl={pnl20:.6} final_nav={nav20:.6} events={events20} fills={fills20}"
+        );
+        assert_eq!(events20, 0, "价格仅跌 1.2%，不应产生强平事件");
+        assert!(nav20 > 0.0, "final_nav 必须为正，got {nav20}");
+    }
+
+    /// 同场景 1x 启用保证金与不启用保证金结果一致
+    #[test]
+    fn controlled_1x_margin_matches_unmargined() {
+        let (nav_off, pnl_off, events_off, fills_off) = run_controlled_decline(1.0, false);
+        let (nav_on, pnl_on, events_on, fills_on) = run_controlled_decline(1.0, true);
+        println!(
+            "[controlled] 1x off: pnl={pnl_off:.6} final_nav={nav_off:.6} events={events_off} fills={fills_off}"
+        );
+        println!(
+            "[controlled] 1x on : pnl={pnl_on:.6} final_nav={nav_on:.6} events={events_on} fills={fills_on}"
+        );
+        assert_eq!(events_off, 0);
+        assert_eq!(events_on, 0);
+        assert_eq!(fills_off, fills_on, "1x 两种口径成交笔数应一致");
+        assert!(
+            (pnl_off - pnl_on).abs() < 1e-9,
+            "1x pnl 应一致: off={pnl_off} on={pnl_on}"
+        );
+        assert!(
+            (nav_off - nav_on).abs() < 1e-9,
+            "1x final_nav 应一致: off={nav_off} on={nav_on}"
+        );
     }
 }
