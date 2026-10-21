@@ -76,6 +76,7 @@ fn new_engine_seeded() -> BacktestEngine {
         initial_cash: 100_000.0,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     };
     let mut engine = BacktestEngine::new(config, EventQueue::new());
     // seed spot + perp 各 5 档 × 1.0 size
@@ -97,6 +98,7 @@ fn empty_run_risk_metrics_zero() {
         initial_cash: 100_000.0,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     };
     let mut engine = BacktestEngine::new(config, EventQueue::new());
     let result = engine.run();

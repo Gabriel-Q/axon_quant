@@ -111,6 +111,7 @@ fn make_backtest_engine<F: FnOnce(&mut EventBuilder, &mut EventQueue)>(
         initial_cash,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     };
     let mut queue = EventQueue::new();
     let mut builder = EventBuilder::new(0);

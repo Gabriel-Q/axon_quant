@@ -198,6 +198,7 @@ fn adapter_config(initial_cash: f64) -> BacktestEngineConfig {
         initial_cash,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     }
 }
 

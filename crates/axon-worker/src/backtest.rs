@@ -214,6 +214,7 @@ impl BacktestRunner {
                 initial_cash,
                 fee_config: FeeConfig::default(),
                 force_liquidate: self.force_liquidate,
+                margin_specs: std::collections::HashMap::new(),
             },
             EventQueue::new(),
         );

@@ -120,6 +120,7 @@ impl PyBacktestEngine {
             // Stage 3 阶段 C(强制平仓):默认关闭,需 Python 端显式调
             // `with_force_liquidate(True)` 启用,避免误触发末日单污染 PnL
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         };
         Ok(Self {
             inner: BacktestEngine::new(config, EventQueue::new()),
@@ -237,6 +238,7 @@ impl PyBacktestEngine {
                 initial_cash: 0.0,
                 fee_config: crate::engine::FeeConfig::default(),
                 force_liquidate: false,
+                margin_specs: std::collections::HashMap::new(),
             },
             EventQueue::new(),
         );

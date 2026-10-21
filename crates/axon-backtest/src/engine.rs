@@ -39,7 +39,9 @@ use axon_core::time::Timestamp;
 use axon_core::types::{Instrument, Price, Quantity, SpotInstrument, Symbol};
 use tracing::trace;
 
-use crate::margin::{LiquidateReason, LiquidationEvent, MarginMode, MarginSnapshot, MarginTracker};
+use crate::margin::{
+    LiquidateReason, LiquidationEvent, MarginMode, MarginSnapshot, MarginSpec, MarginTracker,
+};
 use crate::matching::MatchingEngine;
 use crate::streaming::l3_diff::{L3BookDiff, L3BookSubscriber, SubscriberKind};
 
@@ -66,6 +68,12 @@ pub struct BacktestEngineConfig {
     pub fee_config: FeeConfig,
     /// EOD 强制平仓开关(默认 false,见 BacktestEngineConfig doc)
     pub force_liquidate: bool,
+    /// 每品种保证金规格(key = `"BTC/USDT"`;空 = 未启用保证金 = 零行为变化)
+    ///
+    /// 非空时引擎构造 `MarginTracker`,并在编排层 bar 末调用 `check_margin`。
+    /// key 用字符串而非 `Instrument`:配置链路(Python dict / JSON)本来就是
+    /// 字符串,避免在每层反复做 instrument 编解码。
+    pub margin_specs: HashMap<String, MarginSpec>,
 }
 
 /// 手续费配置(Stage 3 阶段 B 新增)
@@ -98,6 +106,7 @@ impl std::fmt::Debug for BacktestEngineConfig {
             .field("initial_cash", &self.initial_cash)
             .field("fee_config", &self.fee_config)
             .field("force_liquidate", &self.force_liquidate)
+            .field("margin_specs", &self.margin_specs)
             .finish()
     }
 }
@@ -314,6 +323,19 @@ pub struct RunResult {
     /// `positions` + `sharpe_ratio` 派生,通过 PyO3 binding 暴露到
     /// `run_result["risk_metrics"]` dict。
     pub risk_metrics: RiskMetricsReport,
+
+    // ── 保证金 / 强平(0.21.0) ─────────────────────────────
+    /// 强平事件时间线(未启用保证金时为空)
+    pub liquidation_events: Vec<LiquidationEvent>,
+    /// 穿仓兜底累计额(保险基金语义,未启用保证金时恒为 0)
+    pub insurance_fund_loss: f64,
+    /// 判定价口径(v1 固定 `"close"`:bar 级近似,无独立 mark 序列)
+    pub price_basis: String,
+    /// 是否因启用保证金而停用 `capital_budget`
+    ///
+    /// 只有编排层知道预算入参与保证金开关是否互斥,引擎恒填 false,
+    /// 由 worker 覆写。
+    pub capital_budget_disabled: bool,
 }
 
 impl Default for RunResult {
@@ -353,6 +375,11 @@ impl Default for RunResult {
             rebalances_triggered: 0,
             // 0.7.0 新增(Phase 4)
             risk_metrics: RiskMetricsReport::default(),
+            // 0.21.0 新增:保证金 / 强平
+            liquidation_events: Vec::new(),
+            insurance_fund_loss: 0.0,
+            price_basis: "close".to_string(),
+            capital_budget_disabled: false,
         }
     }
 }
@@ -698,6 +725,12 @@ impl BacktestEngine {
     /// - `event_queue`：已填充事件的事件队列（所有权转移）
     pub fn new(config: BacktestEngineConfig, event_queue: EventQueue) -> Self {
         let initial_cash = config.initial_cash;
+        // 保证金:空 specs = 未启用(不构造 tracker,check_margin 是 no-op)
+        let margin = if config.margin_specs.is_empty() {
+            None
+        } else {
+            Some(MarginTracker::new(config.margin_specs.clone()))
+        };
         // 初始 NAV = initial_cash,记入 peak
         let bt_state = BacktestState {
             cash: initial_cash,
@@ -737,7 +770,7 @@ impl BacktestEngine {
             subscribers: HashMap::new(),
             next_subscriber_id: 0,
             // 保证金默认未启用:tracker 为 None,check_margin 直接返回空
-            margin: None,
+            margin,
             insurance_fund_loss: 0.0,
             liquidation_events: Vec::new(),
         }
@@ -2412,6 +2445,12 @@ impl BacktestEngine {
             rebalances_triggered: self.rebalances_triggered,
             // 0.7.0 新增(Phase 4):从 positions + sharpe_ratio 派生风险敞口
             risk_metrics,
+            // 0.21.0 新增:保证金 / 强平(judge 口径固定 close)
+            liquidation_events: self.liquidation_events.clone(),
+            insurance_fund_loss: self.insurance_fund_loss,
+            price_basis: "close".to_string(),
+            // 预算与保证金互斥由编排层判定,引擎不臆测
+            capital_budget_disabled: false,
         }
     }
 }
@@ -2495,6 +2534,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         }
     }
 
@@ -3039,6 +3079,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: true,
+            margin_specs: std::collections::HashMap::new(),
         };
         let mut engine = BacktestEngine::new(config, q);
         let result = engine.run();
@@ -3121,6 +3162,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: true,
+            margin_specs: std::collections::HashMap::new(),
         };
         let mut engine = BacktestEngine::new(config, q);
         let result = engine.run();
@@ -5049,6 +5091,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         };
 
         // 空队列:跑通即说明 routing 集成无 compile/runtime 问题
@@ -5080,6 +5123,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         };
 
         // 入队 BTC 卖单
@@ -5467,5 +5511,50 @@ mod tests {
             engine.check_margin().is_empty(),
             "部分强平后释放保证金,不应连锁触发第二次强平"
         );
+    }
+
+    // ── 配置 / 结果字段(未启用保证金) ─────────────────────
+
+    /// 空 `margin_specs`:不构造 tracker,结果里的保证金字段为默认值
+    #[test]
+    fn run_result_has_empty_margin_fields_when_disabled() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let result = engine.run();
+        assert!(result.liquidation_events.is_empty());
+        assert_eq!(result.insurance_fund_loss, 0.0);
+        assert_eq!(result.price_basis, "close");
+        assert!(!result.capital_budget_disabled);
+        // 行为与旧版一致:无持仓、无事件时 NAV = initial_cash
+        assert_eq!(result.final_nav, 100_000.0);
+        assert!(engine.margin.is_none(), "空 specs 不应构造 tracker");
+        assert!(
+            engine.check_margin().is_empty(),
+            "未启用时 check_margin 是 no-op"
+        );
+    }
+
+    /// 非空 `margin_specs`:引擎构造 tracker(key 为 "BASE/QUOTE" 字符串)
+    #[test]
+    fn margin_specs_construct_tracker() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut config = simple_config();
+        config.margin_specs.insert(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 10.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.005,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.001,
+                    max_leverage: 125.0,
+                }],
+            },
+        );
+        let engine = BacktestEngine::new(config, EventQueue::new());
+        assert!(engine.margin.is_some());
     }
 }
