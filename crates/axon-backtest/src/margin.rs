@@ -24,7 +24,9 @@ pub struct Bracket {
 }
 
 /// 保证金模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 带 `Serialize`：强平事件经 `BacktestResult`（`axon-worker`）序列化时会被直接透传。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MarginMode {
     /// 逐仓：每品种独立子账户，爆仓只影响该品种
     Isolated,
@@ -111,7 +113,7 @@ impl MarginSnapshot {
 }
 
 /// 强平原因。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum LiquidateReason {
     /// 逐档部分强平：减到更低的档位即可恢复
     Partial,
@@ -142,7 +144,7 @@ pub struct LiquidateAction {
 ///
 /// 放在 `margin.rs` 而不是 `engine.rs`:Python 绑定 / 结果序列化都要用,
 /// 与 `MarginTracker` 的语义字段保持同名同义(`tier_from` / `reason` 等)。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LiquidationEvent {
     /// 事件时间戳(纳秒,取模拟时钟)
     pub timestamp_ns: i64,

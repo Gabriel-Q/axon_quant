@@ -27,11 +27,12 @@
 //! - auto_rebalance_threshold 默认 1e-6，避免目标无意义抖动也触发撮合
 //! - RunResult 聚合所有 fill/order 统计 + NAV 曲线（bar_nav_curve 每 bar 一帧）
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axon_backtest::L1MatchingEngine;
 use axon_backtest::engine::{BacktestEngine, BacktestEngineConfig, FeeConfig};
+use axon_backtest::margin::{LiquidationEvent, MarginSpec};
 use axon_core::market::bar::Bar;
 use axon_core::portfolio::{FillRecord, TradeRecord};
 use axon_core::types::{SwapInstrument, SwapSettle};
@@ -70,6 +71,8 @@ pub struct BacktestRunner {
     initial_cash: f64,
     force_liquidate: bool,
     kind: InstrumentKind,
+    /// 每品种保证金规格（key = "BTC/USDT"）。空 map = 不启用保证金模拟
+    margin_specs: HashMap<String, MarginSpec>,
 }
 
 impl BacktestRunner {
@@ -84,6 +87,7 @@ impl BacktestRunner {
             initial_cash: _engine_config.initial_cash,
             force_liquidate: _engine_config.force_liquidate,
             kind: InstrumentKind::Spot,
+            margin_specs: HashMap::new(),
         }
     }
 
@@ -94,7 +98,22 @@ impl BacktestRunner {
             initial_cash,
             force_liquidate: false,
             kind: InstrumentKind::Spot,
+            margin_specs: HashMap::new(),
         }
+    }
+
+    /// 注入每品种保证金规格（空 map = 不启用保证金模拟）
+    pub fn with_margin(mut self, specs: HashMap<String, MarginSpec>) -> Self {
+        self.margin_specs = specs;
+        self
+    }
+
+    /// 原地替换保证金规格（给 Python 绑定用）
+    ///
+    /// 用 setter 而不是 `mem::replace` 重建 runner：后者会把已注册策略、
+    /// futures 品种类型等状态一起丢掉。
+    pub fn set_margin_specs(&mut self, specs: HashMap<String, MarginSpec>) {
+        self.margin_specs = specs;
     }
 
     /// 切换为永续合约品种（futures 模式，支持资金费结算）
@@ -156,7 +175,12 @@ impl BacktestRunner {
     /// - `funding_by_symbol`：资金费查找表（键为纳秒时间戳）
     /// - `capital_budget`：资金约束预算（调用方传 `initial_cash × leverage`）。
     ///   `Some(b)` 时，每个网格点汇总全部 instrument 的目标名义价值，超过 `b`
-    ///   则对所有目标按同一比例缩减，保证「总名义敞口 ≤ b」。单品种传 `None`
+    ///   则对所有目标按同一比例缩减，保证「总名义敞口 ≤ b」。单品种传 `None`。
+    ///
+    ///   注意：启用保证金（`margin_specs` 非空）时预算会被强制停用。
+    ///   原因是 shared 模式的预算缩放会把目标数量按比例压回 `initial_cash` 口径，
+    ///   而杠杆放大正是通过目标数量放大实现的 —— 两者同时生效等于杠杆被抵消；
+    ///   敞口约束改由每品种杠杆 + 维持保证金/强平判定接管。
     ///
     /// # Hold 语义
     /// `Hold` 决策沿用**上一次已生效（可能已被约束缩放）**的目标，而不是策略
@@ -179,6 +203,11 @@ impl BacktestRunner {
         }
 
         let initial_cash = self.initial_cash;
+        // 保证金与资金预算互斥：启用保证金时停用预算缩放，否则杠杆会被预算按比例抵消。
+        // 这里先固化开关与结果标记，避免后面借用/参数变化导致漏记。
+        let margin_enabled = !self.margin_specs.is_empty();
+        let capital_budget_disabled = margin_enabled && capital_budget.is_some();
+        let budget = if margin_enabled { None } else { capital_budget };
 
         // 1) 收集策略涉及的所有 symbol（去重）
         let unique_symbols: Vec<String> = {
@@ -214,7 +243,8 @@ impl BacktestRunner {
                 initial_cash,
                 fee_config: FeeConfig::default(),
                 force_liquidate: self.force_liquidate,
-                margin_specs: std::collections::HashMap::new(),
+                // key 已是 "BASE/QUOTE" 字符串，引擎侧不再做 Instrument 转换
+                margin_specs: self.margin_specs.clone(),
             },
             EventQueue::new(),
         );
@@ -304,7 +334,8 @@ impl BacktestRunner {
             }
 
             // 4e) 资金约束：总名义敞口 ≤ budget，超出则全部目标同比例缩减
-            if let Some(budget) = capital_budget {
+            // `budget` 在启用保证金时已置 None（见函数开头互斥处理）
+            if let Some(budget) = budget {
                 let total_notional: f64 = effective_targets
                     .iter()
                     .filter_map(|(sym, qty)| last_price.get(sym).map(|px| qty.abs() * px))
@@ -359,6 +390,11 @@ impl BacktestRunner {
                     engine.step();
                 }
             }
+
+            // 4i) 保证金检查与强平：放在资金费结算之后，确保本 bar 的权益口径完整
+            if margin_enabled {
+                engine.check_margin();
+            }
         }
 
         // 5) run() 消费 EventQueue + 聚合 RunResult
@@ -398,6 +434,10 @@ impl BacktestRunner {
             final_positions,
             n_bars: grid_len as u64,
             n_strategies: self.strategies.len() as u32,
+            liquidation_events: run_result.liquidation_events.clone(),
+            insurance_fund_loss: run_result.insurance_fund_loss,
+            price_basis: run_result.price_basis.clone(),
+            capital_budget_disabled,
         }
     }
 }
@@ -481,6 +521,14 @@ pub struct BacktestResult {
     pub n_bars: u64,
     /// 策略数
     pub n_strategies: u32,
+    /// 强平事件时间线（未启用保证金时为空）
+    pub liquidation_events: Vec<LiquidationEvent>,
+    /// 穿仓兜底累计额（保险基金语义，未启用保证金时恒为 0）
+    pub insurance_fund_loss: f64,
+    /// 判定价口径（v1 固定 `"close"`）
+    pub price_basis: String,
+    /// 是否因启用保证金而停用了 `capital_budget`
+    pub capital_budget_disabled: bool,
 }
 
 /// 单 bar × 单策略的决策记录
@@ -751,6 +799,82 @@ mod tests {
             final_notional > 0.5,
             "guard should scale down, not wipe out positions (got {final_notional})"
         );
+        // 未启用保证金 → 预算未被接管，仍按原口径生效
+        assert!(!result.capital_budget_disabled);
+    }
+
+    /// 单品种最小保证金规格（币安 BTC 量级，1 档）
+    fn btc_margin_spec() -> MarginSpec {
+        MarginSpec {
+            leverage: 10.0,
+            mode: axon_backtest::MarginMode::Cross,
+            brackets: vec![axon_backtest::Bracket {
+                notional_floor: 0.0,
+                notional_cap: None,
+                mmr: 0.005,
+                cum: 0.0,
+                liquidation_fee_rate: 0.001,
+                max_leverage: 125.0,
+            }],
+        }
+    }
+
+    /// 启用保证金 → 预算必须被停用（否则预算缩放会把杠杆抵消）
+    #[tokio::test]
+    async fn margin_specs_disable_capital_budget() {
+        let bars = make_bars();
+        let state_by_symbol =
+            BTreeMap::from([("BTC/USDT".to_string(), vec![make_state(); bars.len()])]);
+        let bars_by_symbol = BTreeMap::from([(
+            "BTC/USDT".to_string(),
+            bars.iter().cloned().map(Some).collect::<Vec<_>>(),
+        )]);
+
+        let mut runner = BacktestRunner::simple(100_000.0)
+            .with_margin(HashMap::from([("BTC/USDT".to_string(), btc_margin_spec())]));
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+
+        // 同时传预算：启用保证金时应被忽略，并在结果里标记
+        let result = runner
+            .run(
+                &bars_by_symbol,
+                &state_by_symbol,
+                &BTreeMap::new(),
+                Some(1.0),
+            )
+            .await;
+
+        assert!(result.capital_budget_disabled);
+        // 未触发强平时结果字段保持默认口径
+        assert_eq!(result.price_basis, "close");
+        assert_eq!(result.insurance_fund_loss, 0.0);
+    }
+
+    /// 未启用保证金 → 预算标记保持 false（预算继续生效）
+    #[tokio::test]
+    async fn no_margin_specs_keeps_capital_budget_enabled() {
+        let bars = make_bars();
+        let state_by_symbol =
+            BTreeMap::from([("BTC/USDT".to_string(), vec![make_state(); bars.len()])]);
+        let bars_by_symbol = BTreeMap::from([(
+            "BTC/USDT".to_string(),
+            bars.iter().cloned().map(Some).collect::<Vec<_>>(),
+        )]);
+
+        let mut runner = BacktestRunner::simple(100_000.0);
+        runner.add_strategy(Arc::new(RuleStrategyImpl::new("dual_ma", "BTC/USDT")));
+
+        let result = runner
+            .run(
+                &bars_by_symbol,
+                &state_by_symbol,
+                &BTreeMap::new(),
+                Some(1.0),
+            )
+            .await;
+
+        assert!(!result.capital_budget_disabled);
+        assert!(result.liquidation_events.is_empty());
     }
 
     /// None 占位：某品种前两根网格点无 bar → 该品种不参与搓合，也不影响另一品种
