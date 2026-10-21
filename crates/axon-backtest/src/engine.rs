@@ -1891,7 +1891,11 @@ impl BacktestEngine {
     /// - 既无 mark 也无 fallback 的 instrument 用其 `avg_cost` 占位(避免
     ///   没 mark 时 NAV 看起来是 0,误导回测)
     fn compute_nav(&self, _timestamp: Timestamp, fallback_mark: f64) -> f64 {
-        let position_value: f64 = self
+        // 分段估值：
+        // - 保证金品种只计浮盈亏（名义由保证金账本承担，不再占 cash）
+        // - 其余品种保持旧式 `qty × mark` 市值估值
+        // specs 为空时 margined 恒为 0，整条公式退化为旧实现（逐位一致）。
+        let (margined_value, legacy_value): (f64, f64) = self
             .bt_state
             .position_states
             .iter()
@@ -1906,33 +1910,50 @@ impl BacktestEngine {
                     // 多品种共享账户下后者会把 A 品种持仓用 B 品种价格估值,NAV/PnL 失真。
                     .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
                     .unwrap_or(fallback_mark);
-                pos.quantity * mark
+                if self.is_margined(inst) {
+                    (pos.quantity * (mark - pos.avg_cost), 0.0)
+                } else {
+                    (0.0, pos.quantity * mark)
+                }
             })
-            .sum();
+            .fold((0.0, 0.0), |acc, x| (acc.0 + x.0, acc.1 + x.1));
         let isolated_total: f64 = self.bt_state.isolated.values().sum();
-        self.bt_state.cash + isolated_total + position_value
+        self.bt_state.cash + isolated_total + margined_value + legacy_value
     }
 
     /// 0.21.0 新增:按持仓成本口径计算 balance(MT4 语义)
     ///
-    /// 公式:`balance = cash + Σ isolated + Σ(quantity × avg_cost)`
+    /// 公式:`balance = NAV − Σ(quantity × (mark − avg_cost))`
     ///
     /// 与 `compute_nav` 的区别:持仓用 **avg_cost**(开仓成本价)而非 mark 估值。
     /// 因此开仓瞬间 balance 只减少手续费,持仓期间不随价格波动,平仓时按已实现盈亏变化。
     /// 恒等式:`nav - balance == 未实现 PnL(浮盈)`。
     ///
+    /// 等价于旧式 `cash + Σ isolated + Σ(quantity × avg_cost)`：非保证金品种
+    /// 的市值项与浮盈亏项相抵，保证金品种的浮盈亏也只算一次。
+    ///
     /// 这里同样加回 `Σ isolated`:否则逐仓划转会让 balance 凭空少一截,
     /// `nav - balance` 的恒等式立刻被破坏。空账本时结果与旧公式逐位一致。
     fn compute_balance(&self) -> f64 {
-        // cash 已含手续费/资金费/平仓回款;持仓按成本价折算,与 cash 的开仓支出相抵
-        let cost_basis: f64 = self
+        // balance = NAV − 浮盈亏（两种账务模式等价）：
+        // 保证金模式下 NAV 只含浮盈亏，减掉后回到"已实现口径"；
+        // 非保证金模式下 NAV = cash + Σ qty×mark，减掉浮盈亏即 Σ qty×avg_cost。
+        let unrealized: f64 = self
             .bt_state
             .position_states
-            .values()
-            .map(|pos| pos.quantity * pos.avg_cost)
+            .iter()
+            .map(|(inst, pos)| {
+                let mark = self
+                    .bt_state
+                    .mark_cache
+                    .get(inst)
+                    .map(|m| m.as_f64())
+                    .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
+                    .unwrap_or(pos.avg_cost);
+                pos.quantity * (mark - pos.avg_cost)
+            })
             .sum();
-        let isolated_total: f64 = self.bt_state.isolated.values().sum();
-        self.bt_state.cash + isolated_total + cost_basis
+        self.compute_nav(self.config.clock.now(), 0.0) - unrealized
     }
 
     /// 0.5.0 新增(Phase C):处理 Funding 结算事件
@@ -5949,5 +5970,23 @@ mod tests {
         assert!(engine.get_position(&inst) <= 1.05);
         assert_eq!(engine.margin_shortfall_count(), 1);
         assert!(engine.cash_for_test() >= 0.0);
+    }
+
+    /// 保证金品种的 NAV 只计浮盈亏：开仓不因名义而缩水，价格跌 1% 只亏 1% 名义
+    #[test]
+    fn margined_nav_tracks_unrealized_only() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0);
+        engine.rebalance_to_target(Some(1e-6));
+        let nav_open = engine.nav_for_test();
+        assert!((nav_open - 995.0).abs() < 2.0, "nav_open={nav_open}");
+
+        // 价格跌 1%：5000 名义亏 50，NAV ≈ 945
+        engine.begin_bar(99.0, inst.clone());
+        let nav_down = engine.nav_for_test();
+        assert!((nav_down - 945.0).abs() < 5.0, "nav_down={nav_down}");
     }
 }
