@@ -43,6 +43,11 @@ pub struct MarginSpec {
     pub mode: MarginMode,
     /// 按 `notional_floor` 升序；至少 1 档
     pub brackets: Vec<Bracket>,
+    /// 档位来源：`db` / `snapshot` / `default`
+    ///
+    /// 只在结果回显时使用（前端展示"档位来自哪里"），不参与任何计算；
+    /// 由 QuantCell 侧 `build_margin_specs` 记录后随 spec 传入。
+    pub bracket_source: String,
 }
 
 impl MarginSpec {
@@ -99,8 +104,14 @@ pub struct MarginSnapshot {
     pub prices: HashMap<String, f64>,
     /// symbol → 未实现盈亏（计价货币）
     pub unrealized: HashMap<String, f64>,
-    /// 主账户现金（全仓权益基数）
+    /// 主账户现金（自由余额，保证金模式下不含持仓名义）
     pub cash: f64,
+    /// 账户 NAV（cash + Σ逐仓子账户 + Σ浮盈亏 + Σ非保证金品种市值）
+    ///
+    /// 全仓权益直接用 NAV，而不是 `cash + 浮盈亏`：保证金模式下 cash 只记
+    /// 自由余额，"开仓支出"已不再体现在 cash 里，再用旧式相加会把名义重复
+    /// 算成亏损（曾导致 20x 开仓瞬间判爆仓）。
+    pub nav: f64,
 }
 
 impl MarginSnapshot {
@@ -376,6 +387,7 @@ mod tests {
             leverage: 10.0,
             mode: MarginMode::Cross,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         // 10 万名义 = 5 万 × 0.4% + 5 万 × 0.5% = 450
         assert!((spec.maintenance_margin(100_000.0) - 450.0).abs() < 1e-9);
@@ -387,6 +399,7 @@ mod tests {
             leverage: 10.0,
             mode: MarginMode::Cross,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         // 币安语义：MM = 名义 × 该档 mmr − cum；与分段累加必须等价
         let notional = 100_000.0;
@@ -400,6 +413,7 @@ mod tests {
             leverage: 5.0,
             mode: MarginMode::Isolated,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         assert_eq!(spec.maintenance_margin(0.0), 0.0);
         assert_eq!(spec.maintenance_margin(-1.0), 0.0);
@@ -411,6 +425,9 @@ mod tests {
         unrealized: Vec<(&str, f64)>,
         cash: f64,
     ) -> MarginSnapshot {
+        // 测试默认把 NAV 取成旧式 `cash + Σ浮盈亏`，需要"保证金口径 NAV"的
+        // 用例在构造后直接改 `snap.nav`（见 cross_no_liquidation_at_open...）
+        let nav = cash + unrealized.iter().map(|(_, v)| *v).sum::<f64>();
         MarginSnapshot {
             positions: positions
                 .into_iter()
@@ -425,6 +442,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
             cash,
+            nav,
         }
     }
 
@@ -440,6 +458,7 @@ mod tests {
             leverage: 1.0,
             mode: MarginMode::Isolated,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         let mut t = tracker(vec![("BTC/USDT", spec)]);
         t.set_isolated("BTC/USDT", 50_000.0);
@@ -466,6 +485,7 @@ mod tests {
             leverage: 10.0,
             mode: MarginMode::Isolated,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         let mut t = tracker(vec![("BTC/USDT", spec)]);
         t.set_isolated("BTC/USDT", 1_000.0);
@@ -484,6 +504,7 @@ mod tests {
             leverage: lev,
             mode: MarginMode::Cross,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         let t = tracker(vec![("BTC/USDT", mk(10.0)), ("ETH/USDT", mk(10.0))]);
         // 账户权益 -3.05 万，维持保证金 160 远大于它 → 两个品种都要减
@@ -505,6 +526,7 @@ mod tests {
             leverage: 20.0,
             mode: MarginMode::Isolated,
             brackets: btc_brackets(),
+            bracket_source: "default".into(),
         };
         let mut t = tracker(vec![("BTC/USDT", spec)]);
         t.set_isolated("BTC/USDT", 2_500.0);

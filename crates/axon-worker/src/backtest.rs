@@ -816,6 +816,7 @@ mod tests {
                 liquidation_fee_rate: 0.001,
                 max_leverage: 125.0,
             }],
+            bracket_source: "default".into(),
         }
     }
 

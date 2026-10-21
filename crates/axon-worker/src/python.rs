@@ -469,12 +469,19 @@ impl PyBacktestRunner {
                         .unwrap_or(125.0),
                 });
             }
+            // 档位来源只用于结果回显，缺省按 "default"（旧调用方不传该键）
+            let bracket_source = d
+                .get_item("bracket_source")?
+                .map(|x| x.extract::<String>())
+                .transpose()?
+                .unwrap_or_else(|| "default".to_string());
             parsed.insert(
                 sym,
                 MarginSpec {
                     leverage,
                     mode,
                     brackets,
+                    bracket_source,
                 },
             );
         }

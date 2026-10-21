@@ -664,6 +664,11 @@ pub struct BacktestEngine {
     insurance_fund_loss: f64,
     /// 强平事件时间线(每 bar 检查产出的事件累积到这里)
     liquidation_events: Vec<LiquidationEvent>,
+    /// 因可用自由余额不足而被缩量的逐仓开仓次数
+    ///
+    /// 只统计"想开但开不起"的次数,用于结果回显（前端提示"部分开仓受
+    /// 可用保证金限制"）；不影响已成交部分的口径。
+    margin_shortfall_count: u32,
 }
 
 impl std::fmt::Debug for BacktestEngine {
@@ -773,6 +778,7 @@ impl BacktestEngine {
             margin,
             insurance_fund_loss: 0.0,
             liquidation_events: Vec::new(),
+            margin_shortfall_count: 0,
         }
     }
 
@@ -1255,6 +1261,14 @@ impl BacktestEngine {
     /// 只搬运 `cash → isolated`,不动持仓与已实现盈亏,所以划转前后 NAV 不变。
     /// 调用方(编排层)负责按 `名义 / leverage` 决定划入多少。
     pub fn deposit_isolated(&mut self, instrument: &Instrument, margin: f64) {
+        // 保证金模式下自由余额不足时只划可用部分：cash 不允许被保证金划转扣成负数。
+        // 缺口由 `rebalance_to_target` 的开仓缩量负责，这里只是最后一道保险。
+        // 非保证金品种（含 spot）沿用旧语义，不做夹取，保持与历史结果逐位一致。
+        let margin = if self.is_margined(instrument) {
+            margin.min(self.bt_state.cash.max(0.0))
+        } else {
+            margin
+        };
         if margin <= 0.0 {
             return;
         }
@@ -1535,6 +1549,18 @@ impl BacktestEngine {
         self.apply_fill_with_fee(instrument, side, fill, rate);
     }
 
+    /// 该 instrument 是否走保证金账务（spec 存在且为永续）
+    ///
+    /// 只有期货(swap)才可能带保证金：spot 即便同名 key 出现在 specs 里也不改
+    /// 现金流口径，保证现货路径与旧实现逐位一致。
+    fn is_margined(&self, instrument: &Instrument) -> bool {
+        let Some(tracker) = self.margin.as_ref() else {
+            return false;
+        };
+        matches!(instrument, Instrument::Swap(_))
+            && tracker.specs().contains_key(&instrument_key(instrument))
+    }
+
     /// 按指定费率处理单笔 fill(供强平路径使用:强平费 ≠ taker 费率)
     ///
     /// 函数体与原 `apply_fill` 完全一致,只有手续费率由调用方给定。
@@ -1556,9 +1582,18 @@ impl BacktestEngine {
         let notional = fill_price * fill_qty;
         let fee = notional * fee_rate;
         self.bt_state.fee_accumulator += fee;
-        match side {
-            Side::Buy => self.bt_state.cash -= notional + fee,
-            Side::Sell => self.bt_state.cash += notional - fee,
+        if self.is_margined(instrument) {
+            // 保证金模式不搬名义：持仓的合约价值由保证金/权益口径承担，不占自由余额。
+            // 开仓/加仓这里只扣手续费；平仓的已实现盈亏在下方 6 状态机算完后
+            // 统一按 Δrealized_pnl 记回 cash（开仓时为 0，不影响）。
+            // ponytail: 不做逐笔保证金划转，逐仓划转由 `sync_isolated_margins`
+            // 统一处理；上限是同一 bar 内多次加仓只在 bar 末核定一次。
+            self.bt_state.cash -= fee;
+        } else {
+            match side {
+                Side::Buy => self.bt_state.cash -= notional + fee,
+                Side::Sell => self.bt_state.cash += notional - fee,
+            }
         }
 
         // ── 1.5. 0.7.0 新增:记录每笔 fill 到 `fills_detail` ─────────────
@@ -1590,6 +1625,14 @@ impl BacktestEngine {
         };
         // T3.5 改:`position_states.entry(instrument.clone())` 直接以
         // `&Instrument` 作 key,无需 `instrument_to_key` 派生字符串。
+        // 先记录已实现盈亏基线：保证金模式下本笔 fill 结束后只把"本次实现的
+        // 盈亏"记回 cash，不能把历史累计值重复入账。
+        let realized_before = self
+            .bt_state
+            .position_states
+            .get(instrument)
+            .map(|p| p.realized_pnl)
+            .unwrap_or(0.0);
         let pos = self
             .bt_state
             .position_states
@@ -1738,6 +1781,18 @@ impl BacktestEngine {
             }
             // 不应到达 — 防御性兜底
             _ => {}
+        }
+
+        if self.is_margined(instrument) {
+            let realized_after = self
+                .bt_state
+                .position_states
+                .get(instrument)
+                .map(|p| p.realized_pnl)
+                .unwrap_or(0.0);
+            // 平仓/反手时把本次实现的盈亏记回自由余额（开仓/加仓时为 0）。
+            // 逐仓的保证金占用/释放不在这里处理，由 `sync_isolated_margins` 负责。
+            self.bt_state.cash += realized_after - realized_before;
         }
 
         // ── 3. NAV 采样 + log return ─────────────────
@@ -2121,9 +2176,11 @@ impl BacktestEngine {
             } else if held > required {
                 self.release_isolated(&inst, held - required);
             }
-            // 两边账本必须一致:tracker 负责判定,引擎账本负责 NAV
+            // 两边账本必须一致:tracker 负责判定,引擎账本负责 NAV。
+            // 以引擎实际余额为准：deposit 可能在现金不足时被夹小。
+            let actual = self.isolated_balance(&inst);
             if let Some(tracker) = self.margin.as_mut() {
-                tracker.set_isolated(&sym, required);
+                tracker.set_isolated(&sym, actual);
             }
         }
     }
@@ -2232,6 +2289,11 @@ impl BacktestEngine {
         events
     }
 
+    /// 因可用自由余额不足而被缩量的逐仓开仓次数（供结果层 Task 6 透出）
+    pub fn margin_shortfall_count(&self) -> u32 {
+        self.margin_shortfall_count
+    }
+
     /// 把 tracker 的 "BASE/QUOTE" 字符串映射回引擎内部 `Instrument`
     ///
     /// 只从 `position_states` 找:强平只针对有持仓的品种,已清仓的条目
@@ -2269,6 +2331,8 @@ impl BacktestEngine {
             prices,
             unrealized,
             cash: self.bt_state.cash,
+            // 全仓权益直接用 NAV（cash 只记自由余额，不含持仓名义）
+            nav: self.compute_nav(self.config.clock.now(), 0.0),
         }
     }
 
@@ -2329,7 +2393,45 @@ impl BacktestEngine {
             }
             // delta > 0 ⇒ Buy(增加持仓);delta < 0 ⇒ Sell(减少持仓)
             let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
-            let qty = delta.abs();
+            let mut qty = delta.abs();
+            // 逐仓开仓/加仓：所需保证金必须由自由余额支撑，不足则缩量，
+            // 避免保证金划转把 cash 扣成负数（减仓方向不受此限制）。
+            let increasing = current.abs() < 1e-12 || delta.signum() == current.signum();
+            if increasing && self.is_margined(&instrument) {
+                let sym = instrument_key(&instrument);
+                let margin_info = self.margin.as_ref().map(|t| {
+                    (
+                        t.mode_of(&sym),
+                        t.specs()
+                            .get(&sym)
+                            .map(|s| s.leverage.max(1.0))
+                            .unwrap_or(1.0),
+                    )
+                });
+                if let Some((MarginMode::Isolated, leverage)) = margin_info {
+                    let price = self
+                        .bt_state
+                        .bar_mid_by_instrument
+                        .get(&instrument)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if price > 0.0 {
+                        // 可用现金要同时覆盖"保证金占用 + 手续费"：只按名义/杠杆
+                        // 缩量会在成交价略高于 mid 时把 cash 压成负数。
+                        let fee_rate = self.config.fee_config.taker_rate;
+                        let affordable =
+                            self.bt_state.cash.max(0.0) / (price * (1.0 / leverage + fee_rate));
+                        if qty > affordable {
+                            qty = affordable.max(0.0);
+                            self.margin_shortfall_count += 1;
+                        }
+                    }
+                }
+            }
+            if qty <= 1e-12 {
+                // 自由余额完全撑不起本次开仓：本 bar 不开，计数已在上面记录
+                continue;
+            }
             // 0.5.0 修:按 instrument 类型分派 `Order::spot` / `Order::swap`,
             // 之前一律用 `Order::spot` 导致 perp leg 的 `instrument` 字段被错
             // 设为 Spot,路由到 spot book,永远不成交。
@@ -5536,6 +5638,7 @@ mod tests {
                         max_leverage: 100.0,
                     },
                 ],
+                bracket_source: "default".into(),
             },
         )])));
         engine.run();
@@ -5610,6 +5713,7 @@ mod tests {
                     liquidation_fee_rate: 0.004,
                     max_leverage: 125.0,
                 }],
+                bracket_source: "default".into(),
             },
         )])));
         engine.run();
@@ -5671,6 +5775,7 @@ mod tests {
                     liquidation_fee_rate: 0.004,
                     max_leverage: 125.0,
                 }],
+                bracket_source: "default".into(),
             },
         )])));
         engine.run();
@@ -5734,9 +5839,115 @@ mod tests {
                     liquidation_fee_rate: 0.001,
                     max_leverage: 125.0,
                 }],
+                bracket_source: "default".into(),
             },
         );
         let engine = BacktestEngine::new(config, EventQueue::new());
         assert!(engine.margin.is_some());
+    }
+
+    // ── 保证金账务（cash 只记自由余额）测试辅助 ─────────────
+
+    /// 带虚拟对手盘的测试引擎：`begin_bar` 会自动挂 10 层、每层 1 万张的盘口
+    fn new_test_engine(initial_cash: f64) -> BacktestEngine {
+        let mut config = simple_config();
+        config.initial_cash = initial_cash;
+        let mut engine = BacktestEngine::new(config, EventQueue::new());
+        engine.with_seed_liquidity(0.01, 10, 10_000.0);
+        engine
+    }
+
+    fn swap_inst(base: &str, quote: &str) -> Instrument {
+        Instrument::Swap(axon_core::types::SwapInstrument {
+            base: Symbol::from(base),
+            quote: Symbol::from(quote),
+            settle: axon_core::types::SwapSettle::UsdMargin,
+            contract_size: 1.0,
+        })
+    }
+
+    fn spot_inst(base: &str, quote: &str) -> Instrument {
+        Instrument::Spot(SpotInstrument {
+            base: Symbol::from(base),
+            quote: Symbol::from(quote),
+        })
+    }
+
+    impl BacktestEngine {
+        /// 测试内直接注入保证金 tracker（生产路径走 `config.margin_specs`）
+        fn set_margin_for_test(
+            &mut self,
+            instrument: &Instrument,
+            leverage: f64,
+            mode: MarginMode,
+        ) {
+            use crate::margin::{Bracket, MarginSpec};
+            let spec = MarginSpec {
+                leverage,
+                mode,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.004,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            };
+            self.margin = Some(MarginTracker::new(HashMap::from([(
+                instrument_key(instrument),
+                spec,
+            )])));
+        }
+
+        fn cash_for_test(&self) -> f64 {
+            self.bt_state.cash
+        }
+
+        fn nav_for_test(&self) -> f64 {
+            self.compute_nav(self.config.clock.now(), 0.0)
+        }
+    }
+
+    /// 保证金模式开仓只扣手续费，不搬全额名义
+    #[test]
+    fn margined_open_does_not_drain_cash() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0); // 20x：名义 5000
+        engine.rebalance_to_target(Some(1e-6));
+        let cash = engine.cash_for_test();
+        // 开仓只扣手续费（约 5000 × 0.001 = 5），不扣名义
+        assert!((cash - 995.0).abs() < 1.0, "cash={cash}");
+        assert!(engine.get_position(&inst) > 0.0);
+    }
+
+    /// 未启用保证金时保持旧现金流（买入扣全额名义）
+    #[test]
+    fn unmargined_open_keeps_legacy_cash_flow() {
+        let mut engine = new_test_engine(10_000.0);
+        let inst = spot_inst("BTC", "USDT");
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 10.0);
+        engine.rebalance_to_target(Some(1e-6));
+        // 旧口径：cash = 10000 - 1000 - fee
+        assert!(engine.cash_for_test() < 9_001.0);
+    }
+
+    /// 逐仓开仓按可用自由余额缩量，cash 不允许被保证金划转扣成负数
+    #[test]
+    fn isolated_open_is_clamped_by_available_cash() {
+        let mut engine = new_test_engine(100.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 1.0, MarginMode::Isolated);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 10.0); // 10 张 = 1000 名义，但只有 100 现金
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(engine.get_position(&inst) <= 1.05);
+        assert_eq!(engine.margin_shortfall_count(), 1);
+        assert!(engine.cash_for_test() >= 0.0);
     }
 }
