@@ -3,6 +3,8 @@
 //! 这里只做纯计算与账本状态，不碰撮合：强平动作由回测引擎执行
 //! （见 `engine.rs::risk_reduce` / `check_margin`）。
 
+use std::collections::HashMap;
+
 /// 币安 `/fapi/v1/leverageBracket` 的 brackets[] 一一对应。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bracket {
@@ -83,6 +85,205 @@ impl MarginSpec {
     }
 }
 
+/// 强平检查那一刻的账户只读视图。
+///
+/// 用快照而不是让 tracker 反向依赖引擎类型：引擎负责把持仓 / 价格 / 浮盈亏喂进来，
+/// tracker 只做纯函数式的判定，方便单测且不改引擎状态。
+#[derive(Debug, Clone, Default)]
+pub struct MarginSnapshot {
+    /// symbol → 持仓数量（带符号，负为空头）
+    pub positions: HashMap<String, f64>,
+    /// symbol → 本 bar 判定价
+    pub prices: HashMap<String, f64>,
+    /// symbol → 未实现盈亏（计价货币）
+    pub unrealized: HashMap<String, f64>,
+    /// 主账户现金（全仓权益基数）
+    pub cash: f64,
+}
+
+impl MarginSnapshot {
+    /// 某品种的当前名义（数量绝对值 × 判定价）。
+    pub fn notional(&self, symbol: &str) -> f64 {
+        let qty = self.positions.get(symbol).copied().unwrap_or(0.0).abs();
+        let px = self.prices.get(symbol).copied().unwrap_or(0.0);
+        qty * px
+    }
+}
+
+/// 强平原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidateReason {
+    /// 逐档部分强平：减到更低的档位即可恢复
+    Partial,
+    /// 降到最低档仍不够，该品种（逐仓）或账户（全仓）清零
+    Depleted,
+}
+
+/// 一次计划中的强平减仓动作（尚未执行）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidateAction {
+    /// 品种 key（"BTC/USDT"）
+    pub symbol: String,
+    /// 减仓后的目标数量（绝对数量，符号与当前持仓一致）
+    pub target_qty: f64,
+    /// 减仓前所在档位（0-based）
+    pub tier_from: usize,
+    /// 减仓后所在档位（0-based）
+    pub tier_to: usize,
+    /// 本档强平手续费率
+    pub fee_rate: f64,
+    /// 部分强平 / 清零
+    pub reason: LiquidateReason,
+    /// 该品种的保证金模式，事件透传时直接使用
+    pub margin_mode: MarginMode,
+}
+
+/// 保证金追踪器：持有每品种规格与逐仓子账户账本，产出强平计划。
+pub struct MarginTracker {
+    specs: HashMap<String, MarginSpec>,
+    /// 逐仓子账户保证金余额（cross 模式下为空）
+    isolated: HashMap<String, f64>,
+}
+
+impl MarginTracker {
+    /// 用每品种规格构造；`specs` 为空时等价于未启用保证金。
+    pub fn new(specs: HashMap<String, MarginSpec>) -> Self {
+        Self {
+            specs,
+            isolated: HashMap::new(),
+        }
+    }
+
+    /// 设置逐仓子账户余额（0 或负数即视为没有子账户）。
+    pub fn set_isolated(&mut self, symbol: &str, margin: f64) {
+        if margin <= 0.0 {
+            self.isolated.remove(symbol);
+        } else {
+            self.isolated.insert(symbol.to_string(), margin);
+        }
+    }
+
+    /// 逐仓子账户余额；不存在时 0。
+    pub fn isolated(&self, symbol: &str) -> f64 {
+        self.isolated.get(symbol).copied().unwrap_or(0.0)
+    }
+
+    /// 逐仓保证金需求：剩余名义 / leverage。
+    ///
+    /// 杠杆下限夹到 1：0 杠杆会把需求量算成无穷大，属于配置错误而非业务语义。
+    pub fn required_isolated(&self, symbol: &str, notional: f64) -> f64 {
+        match self.specs.get(symbol) {
+            Some(spec) if notional > 0.0 => notional / spec.leverage.max(1.0),
+            _ => 0.0,
+        }
+    }
+
+    /// 生成强平动作，不改任何状态：引擎先执行成交、再回写账本，
+    /// 避免「判定与执行之间」状态被悄悄改写。
+    pub fn plan(&self, snap: &MarginSnapshot) -> Vec<LiquidateAction> {
+        let mut actions: Vec<LiquidateAction> = Vec::new();
+
+        // 逐仓：只看自己的子账户，与其他品种互不影响
+        for (sym, spec) in &self.specs {
+            if spec.mode != MarginMode::Isolated {
+                continue;
+            }
+            let notional = snap.notional(sym);
+            if notional <= 0.0 {
+                continue;
+            }
+            let equity = self.isolated(sym) + snap.unrealized.get(sym).copied().unwrap_or(0.0);
+            if spec.maintenance_margin(notional) < equity {
+                continue;
+            }
+            if let Some(act) = self.reduce_plan(sym, spec, notional, equity, snap) {
+                actions.push(act);
+            }
+        }
+
+        // 全仓：账户级判定，按名义从大到小依次减（贴近币安全仓部分强平顺序）
+        let cross_specs: Vec<(&String, &MarginSpec)> = self
+            .specs
+            .iter()
+            .filter(|(_, s)| s.mode == MarginMode::Cross)
+            .collect();
+        if !cross_specs.is_empty() {
+            let mut order: Vec<(&String, f64)> = cross_specs
+                .iter()
+                .map(|(sym, _)| (*sym, snap.notional(sym)))
+                .filter(|(_, n)| *n > 0.0)
+                .collect();
+            // 同名次的名义可能相等，用 symbol 兜底保证顺序确定（HashMap 迭代顺序不稳定）
+            order.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+            let unrealized_total: f64 = order
+                .iter()
+                .map(|(sym, _)| snap.unrealized.get(*sym).copied().unwrap_or(0.0))
+                .sum();
+            let isolated_total: f64 = order.iter().map(|(sym, _)| self.isolated(sym)).sum();
+            let equity = snap.cash + isolated_total + unrealized_total;
+            let mm_total: f64 = order
+                .iter()
+                .map(|(sym, n)| self.specs[*sym].maintenance_margin(*n))
+                .sum();
+            if mm_total < equity {
+                return actions;
+            }
+            for (sym, notional) in order {
+                if let Some(act) = self.reduce_plan(sym, &self.specs[sym], notional, equity, snap) {
+                    actions.push(act);
+                }
+            }
+        }
+        actions
+    }
+
+    /// 逐档下降：把名义减到低于该档下限，直到维持保证金低于权益。
+    fn reduce_plan(
+        &self,
+        symbol: &str,
+        spec: &MarginSpec,
+        notional: f64,
+        equity: f64,
+        snap: &MarginSnapshot,
+    ) -> Option<LiquidateAction> {
+        let price = snap.prices.get(symbol).copied().unwrap_or(0.0);
+        if price <= 0.0 {
+            return None;
+        }
+        let tier_from = spec.tier_index(notional);
+        // 从当前档位下界开始逐档下探：落到哪一档还能恢复，就停在哪一档
+        for bracket in spec.brackets.iter().take(tier_from + 1).rev() {
+            let candidate_notional = bracket.notional_floor;
+            if candidate_notional <= 0.0 {
+                continue;
+            }
+            if spec.maintenance_margin(candidate_notional) < equity {
+                let qty = candidate_notional / price;
+                return Some(LiquidateAction {
+                    symbol: symbol.to_string(),
+                    target_qty: qty,
+                    tier_from,
+                    tier_to: spec.tier_index(candidate_notional),
+                    fee_rate: spec.liquidation_fee_rate(notional),
+                    reason: LiquidateReason::Partial,
+                    margin_mode: spec.mode,
+                });
+            }
+        }
+        // 最低档仍不够 → 清零（穿仓部分由上层按保险基金口径兜底）
+        Some(LiquidateAction {
+            symbol: symbol.to_string(),
+            target_qty: 0.0,
+            tier_from,
+            tier_to: 0,
+            fee_rate: spec.liquidation_fee_rate(notional),
+            reason: LiquidateReason::Depleted,
+            margin_mode: spec.mode,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +343,119 @@ mod tests {
         };
         assert_eq!(spec.maintenance_margin(0.0), 0.0);
         assert_eq!(spec.maintenance_margin(-1.0), 0.0);
+    }
+
+    fn view(
+        positions: Vec<(&str, f64)>,
+        prices: Vec<(&str, f64)>,
+        unrealized: Vec<(&str, f64)>,
+        cash: f64,
+    ) -> MarginSnapshot {
+        MarginSnapshot {
+            positions: positions
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            prices: prices
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            unrealized: unrealized
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            cash,
+        }
+    }
+
+    fn tracker(specs: Vec<(&str, MarginSpec)>) -> MarginTracker {
+        MarginTracker::new(specs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    #[test]
+    fn isolated_liquidation_reduces_to_lower_tier_not_zero() {
+        // 1x、10 万名义（2 张 × 5 万）、5 万保证金；亏 4.97 万 → 权益 300
+        // 维持保证金 450 > 权益 → 触发，减到第 1 档下限 5 万名义（1 张）后恢复
+        let spec = MarginSpec {
+            leverage: 1.0,
+            mode: MarginMode::Isolated,
+            brackets: btc_brackets(),
+        };
+        let mut t = tracker(vec![("BTC/USDT", spec)]);
+        t.set_isolated("BTC/USDT", 50_000.0);
+        let snap = view(
+            vec![("BTC/USDT", 2.0)],
+            vec![("BTC/USDT", 50_000.0)],
+            vec![("BTC/USDT", -49_700.0)],
+            0.0,
+        );
+        let plan = t.plan(&snap);
+        assert_eq!(plan.len(), 1);
+        let act = &plan[0];
+        assert_eq!(act.reason, LiquidateReason::Partial);
+        // 减到该档下限（5 万名义）即可，不该直接清零
+        assert!(act.target_qty <= 2.0);
+        assert!(act.target_qty >= 0.0);
+        assert_eq!(act.target_qty, 1.0);
+        assert_eq!(act.margin_mode, MarginMode::Isolated);
+    }
+
+    #[test]
+    fn isolated_no_action_when_equity_above_maintenance() {
+        let spec = MarginSpec {
+            leverage: 10.0,
+            mode: MarginMode::Isolated,
+            brackets: btc_brackets(),
+        };
+        let mut t = tracker(vec![("BTC/USDT", spec)]);
+        t.set_isolated("BTC/USDT", 1_000.0);
+        let snap = view(
+            vec![("BTC/USDT", 0.1)],
+            vec![("BTC/USDT", 50_000.0)],
+            vec![("BTC/USDT", 100.0)],
+            9_000.0,
+        );
+        assert!(t.plan(&snap).is_empty());
+    }
+
+    #[test]
+    fn cross_liquidates_largest_notional_first() {
+        let mk = |lev: f64| MarginSpec {
+            leverage: lev,
+            mode: MarginMode::Cross,
+            brackets: btc_brackets(),
+        };
+        let t = tracker(vec![("BTC/USDT", mk(10.0)), ("ETH/USDT", mk(10.0))]);
+        // 账户权益 -3.05 万，维持保证金 160 远大于它 → 两个品种都要减
+        let snap = view(
+            vec![("BTC/USDT", 0.4), ("ETH/USDT", 10.0)],
+            vec![("BTC/USDT", 50_000.0), ("ETH/USDT", 2_000.0)],
+            vec![("BTC/USDT", -30_000.0), ("ETH/USDT", -500.0)],
+            0.0,
+        );
+        let plan = t.plan(&snap);
+        assert!(!plan.is_empty());
+        // 名义更大者先被减（两者名义相等时按 symbol 兜底，BTC 在前）
+        assert_eq!(plan[0].symbol, "BTC/USDT");
+    }
+
+    #[test]
+    fn depleted_reason_when_zeroed() {
+        let spec = MarginSpec {
+            leverage: 20.0,
+            mode: MarginMode::Isolated,
+            brackets: btc_brackets(),
+        };
+        let mut t = tracker(vec![("BTC/USDT", spec)]);
+        t.set_isolated("BTC/USDT", 2_500.0);
+        let snap = view(
+            vec![("BTC/USDT", 1.0)],
+            vec![("BTC/USDT", 50_000.0)],
+            vec![("BTC/USDT", -60_000.0)],
+            0.0,
+        );
+        let plan = t.plan(&snap);
+        assert_eq!(plan[0].reason, LiquidateReason::Depleted);
+        assert_eq!(plan[0].target_qty, 0.0);
     }
 }
