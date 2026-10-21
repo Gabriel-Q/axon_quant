@@ -173,6 +173,22 @@ impl RiskMetricsReport {
     }
 }
 
+/// 单品种「实际生效」的保证金规格（结果回显用）
+///
+/// 与 `margin_specs` 入参的区别：值来自引擎真正构造的 [`MarginTracker`]，
+/// 前端据此核对杠杆 / 模式 / 档位来源是否按预期生效，而不是回显提交值。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EffectiveMarginSpec {
+    /// 品种 key（"BASE/QUOTE"）
+    pub symbol: String,
+    /// 实际生效杠杆
+    pub leverage: f64,
+    /// `"isolated"` / `"cross"`
+    pub margin_mode: String,
+    /// 档位来源：`db` / `snapshot` / `default`
+    pub bracket_source: String,
+}
+
 /// 回测运行结果
 ///
 /// # 0.8.0 重大字段说明 — `equity_curve` vs `bar_nav_curve`
@@ -331,11 +347,14 @@ pub struct RunResult {
     pub insurance_fund_loss: f64,
     /// 判定价口径(v1 固定 `"close"`:bar 级近似,无独立 mark 序列)
     pub price_basis: String,
-    /// 是否因启用保证金而停用 `capital_budget`
-    ///
-    /// 只有编排层知道预算入参与保证金开关是否互斥,引擎恒填 false,
-    /// 由 worker 覆写。
-    pub capital_budget_disabled: bool,
+    /// 是否启用保证金账务（`margin_specs` 非空即启用）
+    pub margin_applied: bool,
+    /// 实际生效的每品种规格（含档位来源），用于前端核对
+    pub margin_specs_effective: Vec<EffectiveMarginSpec>,
+    /// 强平事件条数（= `liquidation_events.len()`）
+    pub liquidation_count: u32,
+    /// 因可用自由余额不足而被缩量的开仓次数
+    pub margin_shortfall_count: u32,
 }
 
 impl Default for RunResult {
@@ -379,7 +398,10 @@ impl Default for RunResult {
             liquidation_events: Vec::new(),
             insurance_fund_loss: 0.0,
             price_basis: "close".to_string(),
-            capital_budget_disabled: false,
+            margin_applied: false,
+            margin_specs_effective: Vec::new(),
+            liquidation_count: 0,
+            margin_shortfall_count: 0,
         }
     }
 }
@@ -2657,9 +2679,37 @@ impl BacktestEngine {
             liquidation_events: self.liquidation_events.clone(),
             insurance_fund_loss: self.insurance_fund_loss,
             price_basis: "close".to_string(),
-            // 预算与保证金互斥由编排层判定,引擎不臆测
-            capital_budget_disabled: false,
+            margin_applied: self.margin.is_some(),
+            margin_specs_effective: self.margin_specs_effective(),
+            liquidation_count: self.liquidation_events.len() as u32,
+            margin_shortfall_count: self.margin_shortfall_count,
         }
+    }
+
+    /// 实际生效的保证金规格（按 symbol 排序，保证结果可复现）
+    ///
+    /// HashMap 迭代顺序不稳定，直接透出会让前端标签顺序每次不同；
+    /// 排序成本极低（品种数个位数），换来结果可逐字对比。
+    fn margin_specs_effective(&self) -> Vec<EffectiveMarginSpec> {
+        let Some(tracker) = self.margin.as_ref() else {
+            return Vec::new();
+        };
+        let mut specs: Vec<EffectiveMarginSpec> = tracker
+            .specs()
+            .iter()
+            .map(|(symbol, spec)| EffectiveMarginSpec {
+                symbol: symbol.clone(),
+                leverage: spec.leverage,
+                margin_mode: match spec.mode {
+                    MarginMode::Isolated => "isolated",
+                    MarginMode::Cross => "cross",
+                }
+                .to_string(),
+                bracket_source: spec.bracket_source.clone(),
+            })
+            .collect();
+        specs.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        specs
     }
 }
 
@@ -5856,7 +5906,10 @@ mod tests {
         assert!(result.liquidation_events.is_empty());
         assert_eq!(result.insurance_fund_loss, 0.0);
         assert_eq!(result.price_basis, "close");
-        assert!(!result.capital_budget_disabled);
+        assert!(!result.margin_applied);
+        assert!(result.margin_specs_effective.is_empty());
+        assert_eq!(result.liquidation_count, 0);
+        assert_eq!(result.margin_shortfall_count, 0);
         // 行为与旧版一致:无持仓、无事件时 NAV = initial_cash
         assert_eq!(result.final_nav, 100_000.0);
         assert!(engine.margin.is_none(), "空 specs 不应构造 tracker");
@@ -5890,6 +5943,45 @@ mod tests {
         );
         let engine = BacktestEngine::new(config, EventQueue::new());
         assert!(engine.margin.is_some());
+    }
+
+    /// 启用保证金时结果透出生效规格（含档位来源）与强平统计
+    #[test]
+    fn run_result_reports_effective_margin_specs() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut config = simple_config();
+        config.margin_specs.insert(
+            "LTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 20.0,
+                mode: MarginMode::Cross,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.001,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            },
+        );
+        let mut engine = BacktestEngine::new(config, EventQueue::new());
+        let result = engine.run();
+
+        assert!(result.margin_applied);
+        assert_eq!(result.margin_specs_effective.len(), 1);
+        let spec = &result.margin_specs_effective[0];
+        assert_eq!(spec.symbol, "LTC/USDT");
+        assert_eq!(spec.leverage, 20.0);
+        assert_eq!(spec.margin_mode, "cross");
+        assert_eq!(spec.bracket_source, "default");
+        assert_eq!(
+            result.liquidation_count,
+            result.liquidation_events.len() as u32
+        );
+        assert_eq!(result.margin_shortfall_count, 0);
     }
 
     // ── 保证金账务（cash 只记自由余额）测试辅助 ─────────────

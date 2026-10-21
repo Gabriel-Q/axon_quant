@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axon_backtest::L1MatchingEngine;
-use axon_backtest::engine::{BacktestEngine, BacktestEngineConfig, FeeConfig};
+use axon_backtest::engine::{BacktestEngine, BacktestEngineConfig, EffectiveMarginSpec, FeeConfig};
 use axon_backtest::margin::{LiquidationEvent, MarginSpec};
 use axon_core::market::bar::Bar;
 use axon_core::portfolio::{FillRecord, TradeRecord};
@@ -204,9 +204,7 @@ impl BacktestRunner {
 
         let initial_cash = self.initial_cash;
         // 保证金与资金预算互斥：启用保证金时停用预算缩放，否则杠杆会被预算按比例抵消。
-        // 这里先固化开关与结果标记，避免后面借用/参数变化导致漏记。
         let margin_enabled = !self.margin_specs.is_empty();
-        let capital_budget_disabled = margin_enabled && capital_budget.is_some();
         let budget = if margin_enabled { None } else { capital_budget };
 
         // 1) 收集策略涉及的所有 symbol（去重）
@@ -450,7 +448,10 @@ impl BacktestRunner {
             liquidation_events: run_result.liquidation_events.clone(),
             insurance_fund_loss: run_result.insurance_fund_loss,
             price_basis: run_result.price_basis.clone(),
-            capital_budget_disabled,
+            margin_applied: run_result.margin_applied,
+            margin_specs_effective: run_result.margin_specs_effective,
+            liquidation_count: run_result.liquidation_count,
+            margin_shortfall_count: run_result.margin_shortfall_count,
         }
     }
 }
@@ -558,8 +559,14 @@ pub struct BacktestResult {
     pub insurance_fund_loss: f64,
     /// 判定价口径（v1 固定 `"close"`）
     pub price_basis: String,
-    /// 是否因启用保证金而停用了 `capital_budget`
-    pub capital_budget_disabled: bool,
+    /// 是否启用保证金账务（`margin_specs` 非空即启用）
+    pub margin_applied: bool,
+    /// 实际生效的每品种规格（含档位来源），用于前端核对
+    pub margin_specs_effective: Vec<EffectiveMarginSpec>,
+    /// 强平事件条数（= `liquidation_events.len()`）
+    pub liquidation_count: u32,
+    /// 因可用保证金不足而被缩量的开仓次数
+    pub margin_shortfall_count: u32,
 }
 
 /// 单 bar × 单策略的决策记录
@@ -831,7 +838,7 @@ mod tests {
             "guard should scale down, not wipe out positions (got {final_notional})"
         );
         // 未启用保证金 → 预算未被接管，仍按原口径生效
-        assert!(!result.capital_budget_disabled);
+        assert!(!result.margin_applied);
     }
 
     /// 单品种最小保证金规格（币安 BTC 量级，1 档）
@@ -851,7 +858,7 @@ mod tests {
         }
     }
 
-    /// 启用保证金 → 预算必须被停用（否则预算缩放会把杠杆抵消）
+    /// 启用保证金 → 预算被停用，结果透出生效规格与强平统计
     #[tokio::test]
     async fn margin_specs_disable_capital_budget() {
         let bars = make_bars();
@@ -876,15 +883,22 @@ mod tests {
             )
             .await;
 
-        assert!(result.capital_budget_disabled);
+        assert!(result.margin_applied);
+        assert_eq!(result.margin_specs_effective.len(), 1);
+        assert_eq!(result.margin_specs_effective[0].symbol, "BTC/USDT");
+        assert_eq!(result.margin_specs_effective[0].bracket_source, "default");
+        assert_eq!(
+            result.liquidation_count,
+            result.liquidation_events.len() as u32
+        );
         // 未触发强平时结果字段保持默认口径
         assert_eq!(result.price_basis, "close");
         assert_eq!(result.insurance_fund_loss, 0.0);
     }
 
-    /// 未启用保证金 → 预算标记保持 false（预算继续生效）
+    /// 未启用保证金 → 结果里的保证金字段全为默认值
     #[tokio::test]
-    async fn no_margin_specs_keeps_capital_budget_enabled() {
+    async fn no_margin_specs_reports_margin_defaults() {
         let bars = make_bars();
         let state_by_symbol =
             BTreeMap::from([("BTC/USDT".to_string(), vec![make_state(); bars.len()])]);
@@ -905,7 +919,10 @@ mod tests {
             )
             .await;
 
-        assert!(!result.capital_budget_disabled);
+        assert!(!result.margin_applied);
+        assert!(result.margin_specs_effective.is_empty());
+        assert_eq!(result.liquidation_count, 0);
+        assert_eq!(result.margin_shortfall_count, 0);
         assert!(result.liquidation_events.is_empty());
     }
 

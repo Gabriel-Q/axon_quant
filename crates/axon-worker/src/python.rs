@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use axon_backtest::engine::EffectiveMarginSpec;
 use axon_backtest::margin::{Bracket, LiquidateReason, LiquidationEvent, MarginMode, MarginSpec};
 use axon_core::market::bar::Bar;
 use axon_core::portfolio::{FillRecord, TradeRecord};
@@ -96,9 +97,17 @@ pub struct PyBacktestResult {
     /// 判定价口径（v1 固定 `"close"`）
     #[pyo3(get)]
     pub price_basis: String,
-    /// 是否因启用保证金而停用了 `capital_budget`
+    /// 是否启用保证金账务
     #[pyo3(get)]
-    pub capital_budget_disabled: bool,
+    pub margin_applied: bool,
+    /// 实际生效的每品种规格（自定义 getter → list[dict]）
+    pub margin_specs_effective: Vec<EffectiveMarginSpec>,
+    /// 强平事件条数
+    #[pyo3(get)]
+    pub liquidation_count: u32,
+    /// 因可用保证金不足而被缩量的开仓次数
+    #[pyo3(get)]
+    pub margin_shortfall_count: u32,
 }
 
 impl From<&BacktestResult> for PyBacktestResult {
@@ -145,7 +154,10 @@ impl From<&BacktestResult> for PyBacktestResult {
             liquidation_events: r.liquidation_events.clone(),
             insurance_fund_loss: r.insurance_fund_loss,
             price_basis: r.price_basis.clone(),
-            capital_budget_disabled: r.capital_budget_disabled,
+            margin_applied: r.margin_applied,
+            margin_specs_effective: r.margin_specs_effective.clone(),
+            liquidation_count: r.liquidation_count,
+            margin_shortfall_count: r.margin_shortfall_count,
         }
     }
 }
@@ -242,6 +254,23 @@ impl PyBacktestResult {
                 },
             )?;
             d.set_item("price_basis", e.price_basis)?;
+            list.append(d)?;
+        }
+        Ok(list)
+    }
+
+    /// 实际生效的保证金规格（`list[dict]`，未启用保证金时为空列表）
+    ///
+    /// 字段名与前端契约一致：symbol / leverage / margin_mode / bracket_source。
+    #[getter]
+    fn margin_specs_effective<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for s in &self.margin_specs_effective {
+            let d = PyDict::new(py);
+            d.set_item("symbol", &s.symbol)?;
+            d.set_item("leverage", s.leverage)?;
+            d.set_item("margin_mode", &s.margin_mode)?;
+            d.set_item("bracket_source", &s.bracket_source)?;
             list.append(d)?;
         }
         Ok(list)

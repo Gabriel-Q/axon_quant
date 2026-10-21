@@ -54,7 +54,11 @@ def test_margin_fields_default_when_disabled():
     assert result.liquidation_events == []
     assert result.insurance_fund_loss == 0.0
     assert result.price_basis == "close"
-    assert result.capital_budget_disabled is False
+    assert result.margin_applied is False
+    assert result.margin_specs_effective == []
+    assert result.liquidation_count == 0
+    assert result.margin_shortfall_count == 0
+    assert not hasattr(result, "capital_budget_disabled")
 
 
 def test_with_margin_runs_with_minimal_brackets():
@@ -76,5 +80,30 @@ def test_with_margin_runs_with_minimal_brackets():
     assert result.n_bars == 5
     assert isinstance(result.liquidation_events, list)
     assert result.price_basis == "close"
+    # 生效规格来自引擎实际构造的 tracker（档位来源缺省为 default）
+    assert result.margin_applied is True
+    assert result.margin_specs_effective == [
+        {
+            "symbol": "BTC/USDT",
+            "leverage": 10.0,
+            "margin_mode": "cross",
+            "bracket_source": "default",
+        }
+    ]
+    assert result.liquidation_count == len(result.liquidation_events)
     # 小额名义 100 USDT 远低于维持保证金阈值，不应产生强平
     assert result.liquidation_events == []
+
+
+def test_result_exposes_effective_specs_and_counts():
+    """未启用保证金时新增结果字段保持中性默认值，且旧 flag 已删除。"""
+    runner = worker.BacktestRunner(initial_cash=10_000.0)
+    runner.add_strategy(BuyStrategy("BTC/USDT"), symbol="BTC/USDT")
+
+    result = runner.run(bars_by_symbol={"BTC/USDT": _bars(100.0, 1.0, 5)})
+
+    assert result.margin_applied is False
+    assert result.margin_specs_effective == []
+    assert result.liquidation_count == 0
+    assert result.margin_shortfall_count == 0
+    assert not hasattr(result, "capital_budget_disabled")
