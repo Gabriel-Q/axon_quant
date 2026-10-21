@@ -287,12 +287,9 @@ impl MarginTracker {
             // 同名次的名义可能相等，用 symbol 兜底保证顺序确定（HashMap 迭代顺序不稳定）
             order.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
-            let unrealized_total: f64 = order
-                .iter()
-                .map(|(sym, _)| snap.unrealized.get(*sym).copied().unwrap_or(0.0))
-                .sum();
-            let isolated_total: f64 = order.iter().map(|(sym, _)| self.isolated(sym)).sum();
-            let equity = snap.cash + isolated_total + unrealized_total;
+            // 全仓权益 = NAV：保证金模式下 cash 不含持仓名义（开仓只扣手续费），
+            // 用 cash + 浮盈亏会把"开仓支出"重复算成亏损（曾导致开仓即爆仓）。
+            let equity = snap.nav;
             let mm_total: f64 = order
                 .iter()
                 .map(|(sym, n)| self.specs[*sym].maintenance_margin(*n))
@@ -518,6 +515,27 @@ mod tests {
         assert!(!plan.is_empty());
         // 名义更大者先被减（两者名义相等时按 symbol 兜底，BTC 在前）
         assert_eq!(plan[0].symbol, "BTC/USDT");
+    }
+
+    /// 全仓权益取 NAV：20x 开仓时名义 5000 由持仓承担，权益仍是 995 →
+    /// 维持保证金 20 远小于权益，不应判爆仓（旧口径 cash+浮盈亏会算出负数）。
+    #[test]
+    fn cross_no_liquidation_at_open_when_equity_is_nav() {
+        let spec = MarginSpec {
+            leverage: 20.0,
+            mode: MarginMode::Cross,
+            brackets: btc_brackets(),
+            bracket_source: "default".into(),
+        };
+        let t = tracker(vec![("LTC/USDT", spec)]);
+        let mut snap = view(
+            vec![("LTC/USDT", 50.0)],
+            vec![("LTC/USDT", 100.0)],
+            vec![("LTC/USDT", 0.0)],
+            995.0,
+        );
+        snap.nav = 995.0; // 名义 5000 由持仓承担，权益仍是 995
+        assert!(t.plan(&snap).is_empty());
     }
 
     #[test]
