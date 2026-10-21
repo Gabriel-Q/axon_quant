@@ -138,6 +138,34 @@ pub struct LiquidateAction {
     pub margin_mode: MarginMode,
 }
 
+/// 一次已执行的强平事件(结果层时间线)。
+///
+/// 放在 `margin.rs` 而不是 `engine.rs`:Python 绑定 / 结果序列化都要用,
+/// 与 `MarginTracker` 的语义字段保持同名同义(`tier_from` / `reason` 等)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidationEvent {
+    /// 事件时间戳(纳秒,取模拟时钟)
+    pub timestamp_ns: i64,
+    /// 品种 key("BTC/USDT")
+    pub symbol: String,
+    /// 逐仓 / 全仓
+    pub margin_mode: MarginMode,
+    /// 强平前所在档位(0-based)
+    pub tier_from: usize,
+    /// 强平后所在档位(0-based)
+    pub tier_to: usize,
+    /// 实际减掉的数量(绝对值)
+    pub reduced_qty: f64,
+    /// 判定价
+    pub price: f64,
+    /// 强平手续费(计价货币)
+    pub fee: f64,
+    /// 部分强平 / 清零
+    pub reason: LiquidateReason,
+    /// 判定价口径;v1 固定 `"close"`
+    pub price_basis: &'static str,
+}
+
 /// 保证金追踪器：持有每品种规格与逐仓子账户账本，产出强平计划。
 pub struct MarginTracker {
     specs: HashMap<String, MarginSpec>,
@@ -176,6 +204,37 @@ impl MarginTracker {
             Some(spec) if notional > 0.0 => notional / spec.leverage.max(1.0),
             _ => 0.0,
         }
+    }
+
+    /// 强平成交后回写子账户：先扣强平费，再按剩余名义所需保证金"压回"，
+    /// 多余部分由调用方释放回主账户。
+    ///
+    /// **必须在每档减仓后调用**：不释放多余保证金，下一 bar 的 `equity`
+    /// 仍按旧保证金计算，会再次判定爆仓 → 连锁误强平（设计 §2.3 的关键点）。
+    ///
+    /// 返回穿仓兜底额（>= 0）：子账户不足以覆盖剩余保证金需求时，缺口按
+    /// 保险基金口径记账，由调用方累加到 `insurance_fund_loss`。
+    pub fn settle_after_reduce(&mut self, symbol: &str, remaining_notional: f64, fee: f64) -> f64 {
+        let required = self.required_isolated(symbol, remaining_notional);
+        let after_fee = self.isolated(symbol) - fee.max(0.0);
+        // 子账户只保留"剩余名义所需保证金"；负数按 0 处理，不会留负余额
+        let kept = after_fee.max(0.0).min(required);
+        let written_off = (required - after_fee).max(0.0);
+        self.set_isolated(symbol, kept);
+        written_off
+    }
+
+    /// 每品种规格（只读）
+    pub fn specs(&self) -> &HashMap<String, MarginSpec> {
+        &self.specs
+    }
+
+    /// 某品种的保证金模式；未配置时按全仓处理（与"启用即全品种参与"一致）
+    pub fn mode_of(&self, symbol: &str) -> MarginMode {
+        self.specs
+            .get(symbol)
+            .map(|s| s.mode)
+            .unwrap_or(MarginMode::Cross)
     }
 
     /// 生成强平动作，不改任何状态：引擎先执行成交、再回写账本，

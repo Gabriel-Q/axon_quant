@@ -39,6 +39,7 @@ use axon_core::time::Timestamp;
 use axon_core::types::{Instrument, Price, Quantity, SpotInstrument, Symbol};
 use tracing::trace;
 
+use crate::margin::{LiquidateReason, LiquidationEvent, MarginMode, MarginSnapshot, MarginTracker};
 use crate::matching::MatchingEngine;
 use crate::streaming::l3_diff::{L3BookDiff, L3BookSubscriber, SubscriberKind};
 
@@ -630,6 +631,12 @@ pub struct BacktestEngine {
     subscribers: HashMap<u64, (Box<dyn L3BookSubscriber>, SubscriberKind)>,
     /// 0.9.0 C2.1 新增:订阅者 ID 自增
     next_subscriber_id: u64,
+    /// 保证金追踪器(`None` = 未启用保证金,零行为变化)
+    margin: Option<MarginTracker>,
+    /// 累计穿仓兜底额(保险基金语义)
+    insurance_fund_loss: f64,
+    /// 强平事件时间线(每 bar 检查产出的事件累积到这里)
+    liquidation_events: Vec<LiquidationEvent>,
 }
 
 impl std::fmt::Debug for BacktestEngine {
@@ -729,6 +736,10 @@ impl BacktestEngine {
             // 0.9.0 C2.1 新增:订阅者注册表默认空,id 从 0 开始
             subscribers: HashMap::new(),
             next_subscriber_id: 0,
+            // 保证金默认未启用:tracker 为 None,check_margin 直接返回空
+            margin: None,
+            insurance_fund_loss: 0.0,
+            liquidation_events: Vec::new(),
         }
     }
 
@@ -2041,6 +2052,136 @@ impl BacktestEngine {
         filled
     }
 
+    /// 逐 bar 保证金检查:判定 → 强平减仓 → 释放保证金 → 记录事件。
+    ///
+    /// 返回本 bar 产生的事件(同时累积到 `self.liquidation_events`)。
+    /// 未启用保证金(tracker 为 None)时是 no-op,保证零行为变化。
+    ///
+    /// 调用时机:bar 末 funding 结算之后(设计 §2.3 的执行顺序)。
+    pub fn check_margin(&mut self) -> Vec<LiquidationEvent> {
+        if self.margin.is_none() {
+            return Vec::new();
+        }
+        // 1) 快照(不可变借用,函数返回后即释放)
+        let snapshot = self.margin_snapshot();
+        // 2) 计划(只读):判定与执行分离,避免判定期间账本被改写
+        let actions = match self.margin.as_ref() {
+            Some(tracker) => tracker.plan(&snapshot),
+            None => return Vec::new(),
+        };
+        if actions.is_empty() {
+            return Vec::new();
+        }
+
+        let timestamp_ns = self.config.clock.now().nanos;
+        let mut events = Vec::new();
+        for act in actions {
+            let price = snapshot.prices.get(&act.symbol).copied().unwrap_or(0.0);
+            if price <= 0.0 {
+                continue;
+            }
+            let Some(inst) = self.instrument_for_symbol(&act.symbol) else {
+                continue;
+            };
+            let before_qty = self.get_position(&inst);
+            let filled = self.risk_reduce(&inst, act.target_qty, act.fee_rate);
+            if filled == 0 {
+                continue;
+            }
+            let after_qty = self.get_position(&inst);
+            let reduced_qty = (before_qty - after_qty).abs();
+            let fee = reduced_qty * price * act.fee_rate;
+
+            if act.margin_mode == MarginMode::Isolated {
+                let held = self.isolated_balance(&inst);
+                let written_off = self
+                    .margin
+                    .as_mut()
+                    .expect("margin 存在性已在上方判定")
+                    .settle_after_reduce(&act.symbol, after_qty.abs() * price, fee);
+                let kept = self
+                    .margin
+                    .as_ref()
+                    .expect("margin 存在性已在上方判定")
+                    .isolated(&act.symbol);
+                // 引擎账本镜像 tracker:把"扣掉的强平费 + 多余保证金"一起搬回 cash。
+                // 强平费在 apply_fill 里已从 cash 扣过一次,这里的多释放部分正是把它补回,
+                // 等效于"逐仓强平费从子账户扣"(设计 §2.3),NAV 只损失一次费用。
+                if held > kept {
+                    self.release_isolated(&inst, held - kept);
+                }
+                if written_off > 0.0 {
+                    self.insurance_fund_loss += written_off;
+                }
+            }
+
+            events.push(LiquidationEvent {
+                timestamp_ns,
+                symbol: act.symbol.clone(),
+                margin_mode: act.margin_mode,
+                tier_from: act.tier_from,
+                tier_to: act.tier_to,
+                reduced_qty,
+                price,
+                fee,
+                // 实际已清零就以实际为准,避免 tracker 计划与成交结果不一致时事件误导
+                reason: if after_qty.abs() < 1e-12 {
+                    LiquidateReason::Depleted
+                } else {
+                    act.reason
+                },
+                price_basis: "close",
+            });
+        }
+        self.liquidation_events.extend(events.iter().cloned());
+        events
+    }
+
+    /// 把 tracker 的 "BASE/QUOTE" 字符串映射回引擎内部 `Instrument`
+    ///
+    /// 只从 `position_states` 找:强平只针对有持仓的品种,已清仓的条目
+    /// 仍留在 map 里(quantity=0),但不会产生新的强平动作。
+    fn instrument_for_symbol(&self, symbol: &str) -> Option<Instrument> {
+        self.bt_state
+            .position_states
+            .keys()
+            .find(|inst| instrument_key(inst) == symbol)
+            .cloned()
+    }
+
+    /// 构建保证金判定所需的只读快照
+    ///
+    /// 判定价优先级:`mark_cache` → 本 bar 的 `bar_mid_by_instrument` → 持仓 `avg_cost`。
+    /// 最后一级兜底是必要的:两者都没有时(纯离线 bar 回测未推 mark)若返回 0,
+    /// 名义会被算成 0、维持保证金恒为 0,强平永远不触发。
+    fn margin_snapshot(&self) -> MarginSnapshot {
+        let mut positions = HashMap::new();
+        let mut prices = HashMap::new();
+        let mut unrealized = HashMap::new();
+        for (inst, pos) in &self.bt_state.position_states {
+            if pos.quantity.abs() < 1e-12 {
+                continue; // 已清仓,不参与名义 / 维持保证金求和
+            }
+            let sym = instrument_key(inst);
+            let price = self
+                .bt_state
+                .mark_cache
+                .get(inst)
+                .map(|m| m.as_f64())
+                .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
+                .unwrap_or(pos.avg_cost);
+            positions.insert(sym.clone(), pos.quantity);
+            prices.insert(sym.clone(), price);
+            unrealized.insert(sym, (price - pos.avg_cost) * pos.quantity);
+        }
+        MarginSnapshot {
+            positions,
+            prices,
+            unrealized,
+            cash: self.bt_state.cash,
+        }
+    }
+
     /// 0.5.0 新增(Phase D):手动触发 rebalance
     ///
     /// 遍历 `bt_state.legs`:
@@ -2272,6 +2413,17 @@ impl BacktestEngine {
             // 0.7.0 新增(Phase 4):从 positions + sharpe_ratio 派生风险敞口
             risk_metrics,
         }
+    }
+}
+
+/// 引擎内部 `Instrument` → 保证金模块使用的 "BASE/QUOTE" key
+///
+/// 保证金配置(`margin_specs`)全链路统一用字符串 key,避免 `Spot` / `Swap`
+/// 同名品种在 tracker 里各占一份账本;回测单品种单合约,不存在歧义。
+fn instrument_key(inst: &Instrument) -> String {
+    match inst {
+        Instrument::Spot(s) => format!("{}/{}", s.base.as_str(), s.quote.as_str()),
+        Instrument::Swap(s) => format!("{}/{}", s.base.as_str(), s.quote.as_str()),
     }
 }
 
@@ -5222,5 +5374,98 @@ mod tests {
         engine.begin_bar(100.0, inst.clone());
         assert_eq!(engine.risk_reduce(&inst, 0.0, 0.004), 0);
         assert_eq!(engine.risk_reduce(&inst, -1.0, 0.004), 0);
+    }
+
+    // ── 保证金检查与强平(逐仓) ─────────────────────────
+
+    /// 逐仓部分强平后必须释放多余保证金,否则下一 bar 再次判定爆仓(连锁误强平)
+    #[test]
+    fn liquidation_releases_margin_and_does_not_chain() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 卖 1.2 @ 50_050 供开仓市价买吃;买 5.0 @ 49_950 留在 book 供强平卖单吃
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 50_050.0, 1.2);
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(49_950.0),
+                },
+                Quantity::from_f64(5.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.run();
+        engine.set_target_position(inst.clone(), 1.2);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        assert!((engine.get_position(&inst) - 1.2).abs() < 1e-9);
+
+        // 逐仓:1.2 × 50_050 / 100x ≈ 600.6 保证金划入子账户
+        engine.deposit_isolated(&inst, 600.6);
+        let brackets = vec![
+            Bracket {
+                notional_floor: 0.0,
+                notional_cap: Some(50_000.0),
+                mmr: 0.004,
+                cum: 0.0,
+                liquidation_fee_rate: 0.004,
+                max_leverage: 125.0,
+            },
+            // 第二档 MMR 放大到 10%:让 6 万名义的维持保证金远高于子账户权益,
+            // 触发"减到下一档下限即可恢复"的部分强平
+            Bracket {
+                notional_floor: 50_000.0,
+                notional_cap: Some(600_000.0),
+                mmr: 0.1,
+                cum: 0.0,
+                liquidation_fee_rate: 0.004,
+                max_leverage: 100.0,
+            },
+        ];
+        let mut tracker = MarginTracker::new(HashMap::from([(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 100.0,
+                mode: MarginMode::Isolated,
+                brackets,
+            },
+        )]));
+        tracker.set_isolated("BTC/USDT", 600.6);
+        // 引擎按 config.margin_specs 构造 tracker 的路径在 Task 6 接入,这里直接注入
+        engine.margin = Some(tracker);
+
+        // bar mid = 49_950 → 名义 59_940、维持保证金 1_194 > 权益 480.6 → 触发
+        engine.begin_bar(49_950.0, inst.clone());
+        let events = engine.check_margin();
+        assert_eq!(events.len(), 1, "应产生 1 条部分强平事件");
+        let ev = &events[0];
+        assert_eq!(ev.symbol, "BTC/USDT");
+        assert_eq!(ev.margin_mode, MarginMode::Isolated);
+        assert_eq!(ev.reason, LiquidateReason::Partial);
+        assert_eq!(ev.tier_from, 1);
+        assert_eq!(ev.tier_to, 0);
+        assert!((ev.price - 49_950.0).abs() < 1e-9);
+        assert!(ev.reduced_qty > 0.0 && ev.reduced_qty < 1.2);
+        assert!(ev.fee > 0.0);
+        assert_eq!(ev.price_basis, "close");
+        // 剩余名义 5 万 / 100x = 500 保证金;多余部分已释放回 cash
+        assert!((engine.isolated_balance(&inst) - 500.0).abs() < 1.0);
+        assert_eq!(engine.insurance_fund_loss, 0.0);
+
+        // 同一价格再检查一次:多余保证金已释放 → 不应再有事件(不连锁)
+        assert!(
+            engine.check_margin().is_empty(),
+            "部分强平后释放保证金,不应连锁触发第二次强平"
+        );
     }
 }
