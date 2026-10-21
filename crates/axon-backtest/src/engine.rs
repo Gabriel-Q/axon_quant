@@ -2085,6 +2085,62 @@ impl BacktestEngine {
         filled
     }
 
+    /// 逐仓保证金核定:按当前判定价把各逐仓品种的子账户余额补足/释放到位。
+    ///
+    /// 调用时机:
+    /// - `rebalance_to_target` 结束处:开仓/调仓当 bar 就完成划转,不等下一次检查
+    /// - `check_margin` 开头:先按最新 bar 价核定,再做强平判定
+    ///
+    /// 不核定会怎样:逐仓子账户恒为 0,`equity = 0 + 浮盈亏`,只要持仓有微小浮亏
+    /// 就会被判爆仓 —— 逐仓模式实际不可用。
+    ///
+    /// ponytail:按 bar 末价格核定保证金,不做 bar 内逐笔划转;升级路径是把核定
+    /// 挂到 fill 事件上(开/加/减仓即时划转)。
+    pub fn sync_isolated_margins(&mut self) {
+        if self.margin.is_none() {
+            return;
+        }
+        // 先收集目标(不可变借用),再统一划转(可变借用),避免借用冲突
+        let mut targets: Vec<(Instrument, f64, String)> = Vec::new();
+        if let Some(tracker) = self.margin.as_ref() {
+            for (inst, pos) in &self.bt_state.position_states {
+                let sym = instrument_key(inst);
+                if tracker.mode_of(&sym) != MarginMode::Isolated {
+                    continue;
+                }
+                let price = self.judged_price(inst, pos.avg_cost);
+                // 清仓后 quantity=0 → required=0 → 全额释放剩余保证金
+                let required = tracker.required_isolated(&sym, pos.quantity.abs() * price);
+                targets.push((inst.clone(), required, sym));
+            }
+        }
+        for (inst, required, sym) in targets {
+            let held = self.isolated_balance(&inst);
+            if required > held {
+                self.deposit_isolated(&inst, required - held);
+            } else if held > required {
+                self.release_isolated(&inst, held - required);
+            }
+            // 两边账本必须一致:tracker 负责判定,引擎账本负责 NAV
+            if let Some(tracker) = self.margin.as_mut() {
+                tracker.set_isolated(&sym, required);
+            }
+        }
+    }
+
+    /// 单个 instrument 的判定价:`mark_cache` → 本 bar 的 mid → 调用方给的兜底价
+    ///
+    /// 保证金核定与快照共用同一套顺序,避免"核定用均价、判定用 mark"导致
+    /// 两边算出不同的保证金需求。
+    fn judged_price(&self, instrument: &Instrument, fallback: f64) -> f64 {
+        self.bt_state
+            .mark_cache
+            .get(instrument)
+            .map(|m| m.as_f64())
+            .or_else(|| self.bt_state.bar_mid_by_instrument.get(instrument).copied())
+            .unwrap_or(fallback)
+    }
+
     /// 逐 bar 保证金检查:判定 → 强平减仓 → 释放保证金 → 记录事件。
     ///
     /// 返回本 bar 产生的事件(同时累积到 `self.liquidation_events`)。
@@ -2095,6 +2151,9 @@ impl BacktestEngine {
         if self.margin.is_none() {
             return Vec::new();
         }
+        // 0) 先按最新判定价把逐仓子账户补足/释放:否则刚开仓的逐仓品种子账户为 0,
+        //    权益只剩浮盈亏,任何微小浮亏都会被误判强平
+        self.sync_isolated_margins();
         // 1) 快照(不可变借用,函数返回后即释放)
         let snapshot = self.margin_snapshot();
         // 2) 计划(只读):判定与执行分离,避免判定期间账本被改写
@@ -2102,9 +2161,6 @@ impl BacktestEngine {
             Some(tracker) => tracker.plan(&snapshot),
             None => return Vec::new(),
         };
-        if actions.is_empty() {
-            return Vec::new();
-        }
 
         let timestamp_ns = self.config.clock.now().nanos;
         let mut events = Vec::new();
@@ -2127,8 +2183,7 @@ impl BacktestEngine {
 
             if act.margin_mode == MarginMode::Isolated {
                 let held = self.isolated_balance(&inst);
-                let written_off = self
-                    .margin
+                self.margin
                     .as_mut()
                     .expect("margin 存在性已在上方判定")
                     .settle_after_reduce(&act.symbol, after_qty.abs() * price, fee);
@@ -2142,9 +2197,6 @@ impl BacktestEngine {
                 // 等效于"逐仓强平费从子账户扣"(设计 §2.3),NAV 只损失一次费用。
                 if held > kept {
                     self.release_isolated(&inst, held - kept);
-                }
-                if written_off > 0.0 {
-                    self.insurance_fund_loss += written_off;
                 }
             }
 
@@ -2167,6 +2219,16 @@ impl BacktestEngine {
             });
         }
         self.liquidation_events.extend(events.iter().cloned());
+
+        // 3) 穿仓兜底:强平后账户权益仍为负 → 保险基金把 NAV 抬回 0。
+        //    缺口只在这里记一次(settle_after_reduce 不返回缺口),避免双重计入;
+        //    设计 §2.5 要求 final_nav >= 0 成为不变量。
+        let nav = self.compute_nav(self.config.clock.now(), 0.0);
+        if nav < 0.0 {
+            self.bt_state.cash += -nav;
+            self.insurance_fund_loss += -nav;
+        }
+
         events
     }
 
@@ -2196,13 +2258,8 @@ impl BacktestEngine {
                 continue; // 已清仓,不参与名义 / 维持保证金求和
             }
             let sym = instrument_key(inst);
-            let price = self
-                .bt_state
-                .mark_cache
-                .get(inst)
-                .map(|m| m.as_f64())
-                .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
-                .unwrap_or(pos.avg_cost);
+            // 判定价复用 `judged_price`:保证金核定与强平判定必须用同一套兜底顺序
+            let price = self.judged_price(inst, pos.avg_cost);
             positions.insert(sym.clone(), pos.quantity);
             prices.insert(sym.clone(), price);
             unrealized.insert(sym, (price - pos.avg_cost) * pos.quantity);
@@ -2312,6 +2369,9 @@ impl BacktestEngine {
         if triggered > 0 {
             self.last_rebalance_bar_id = self.bar_id;
         }
+        // 开仓/调仓当 bar 就按最新判定价核定逐仓保证金,而不是拖到下一次 check_margin;
+        // 放在这里也覆盖了 begin_bar 收尾的自动 rebalance 路径(每 bar 顺带 mark 一次)。
+        self.sync_isolated_margins();
         triggered
     }
 
@@ -5449,44 +5509,41 @@ mod tests {
         ));
 
         let mut engine = BacktestEngine::new(simple_config(), q);
-        engine.run();
-        engine.set_target_position(inst.clone(), 1.2);
-        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
-        assert!((engine.get_position(&inst) - 1.2).abs() < 1e-9);
-
-        // 逐仓:1.2 × 50_050 / 100x ≈ 600.6 保证金划入子账户
-        engine.deposit_isolated(&inst, 600.6);
-        let brackets = vec![
-            Bracket {
-                notional_floor: 0.0,
-                notional_cap: Some(50_000.0),
-                mmr: 0.004,
-                cum: 0.0,
-                liquidation_fee_rate: 0.004,
-                max_leverage: 125.0,
-            },
-            // 第二档 MMR 放大到 10%:让 6 万名义的维持保证金远高于子账户权益,
-            // 触发"减到下一档下限即可恢复"的部分强平
-            Bracket {
-                notional_floor: 50_000.0,
-                notional_cap: Some(600_000.0),
-                mmr: 0.1,
-                cum: 0.0,
-                liquidation_fee_rate: 0.004,
-                max_leverage: 100.0,
-            },
-        ];
-        let mut tracker = MarginTracker::new(HashMap::from([(
+        // 生产路径由 `config.margin_specs` 构造 tracker;测试直接注入等价 tracker,
+        // 子账户余额交给 `sync_isolated_margins` 按开仓价核定,不再手工 set_isolated
+        engine.margin = Some(MarginTracker::new(HashMap::from([(
             "BTC/USDT".to_string(),
             MarginSpec {
                 leverage: 100.0,
                 mode: MarginMode::Isolated,
-                brackets,
+                brackets: vec![
+                    Bracket {
+                        notional_floor: 0.0,
+                        notional_cap: Some(50_000.0),
+                        mmr: 0.004,
+                        cum: 0.0,
+                        liquidation_fee_rate: 0.004,
+                        max_leverage: 125.0,
+                    },
+                    // 第二档 MMR 放大到 10%:让 6 万名义的维持保证金远高于子账户权益,
+                    // 触发"减到下一档下限即可恢复"的部分强平
+                    Bracket {
+                        notional_floor: 50_000.0,
+                        notional_cap: Some(600_000.0),
+                        mmr: 0.1,
+                        cum: 0.0,
+                        liquidation_fee_rate: 0.004,
+                        max_leverage: 100.0,
+                    },
+                ],
             },
-        )]));
-        tracker.set_isolated("BTC/USDT", 600.6);
-        // 引擎按 config.margin_specs 构造 tracker 的路径在 Task 6 接入,这里直接注入
-        engine.margin = Some(tracker);
+        )])));
+        engine.run();
+        engine.set_target_position(inst.clone(), 1.2);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        assert!((engine.get_position(&inst) - 1.2).abs() < 1e-9);
+        // 开仓当 bar 即完成划转:1.2 × 50_050 / 100x = 600.6
+        assert!((engine.isolated_balance(&inst) - 600.6).abs() < 1e-9);
 
         // bar mid = 49_950 → 名义 59_940、维持保证金 1_194 > 权益 480.6 → 触发
         engine.begin_bar(49_950.0, inst.clone());
@@ -5510,6 +5567,131 @@ mod tests {
         assert!(
             engine.check_margin().is_empty(),
             "部分强平后释放保证金,不应连锁触发第二次强平"
+        );
+    }
+
+    /// 逐仓开仓后子账户保证金真的划入,小浮亏不应被误判强平
+    #[test]
+    fn isolated_position_is_not_liquidated_right_after_open() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 卖 1.0 @ 50_000 供开仓吃;买 5.0 @ 49_000 留在 book(若误判强平会真的成交)
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 50_000.0, 1.0);
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(49_000.0),
+                },
+                Quantity::from_f64(5.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.margin = Some(MarginTracker::new(HashMap::from([(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 1.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.004,
+                    max_leverage: 125.0,
+                }],
+            },
+        )])));
+        engine.run();
+        engine.set_target_position(inst.clone(), 1.0);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        // 1x:1.0 × 50_000 / 1 = 50_000 保证金已从 cash 划入子账户
+        assert!((engine.isolated_balance(&inst) - 50_000.0).abs() < 1e-9);
+
+        // 价格 50_000 → 49_990,浮亏 10 美元,远低于维持保证金
+        engine.begin_bar(49_990.0, inst.clone());
+        let events = engine.check_margin();
+        assert!(events.is_empty(), "刚开仓的小浮亏不应触发强平");
+        assert!(
+            engine.isolated_balance(&inst) > 0.0,
+            "逐仓子账户必须真的有余额"
+        );
+        assert!((engine.isolated_balance(&inst) - 49_990.0).abs() < 1e-6);
+        assert_eq!(engine.insurance_fund_loss, 0.0);
+        assert!(engine.compute_nav(Timestamp::from_nanos(0), 0.0) > 0.0);
+    }
+
+    /// 极端下跌穿仓:强平后 NAV 被保险基金抬到 0,缺口只记一次
+    #[test]
+    fn isolated_liquidation_zeroes_nav_not_negative() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 200 张 @ 1_000 开多(名义 20 万,远超 10 万本金);价格跌到 10 即穿仓
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 1_000.0, 200.0);
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(10.0),
+                },
+                Quantity::from_f64(200.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.margin = Some(MarginTracker::new(HashMap::from([(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 100.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.004,
+                    max_leverage: 125.0,
+                }],
+            },
+        )])));
+        engine.run();
+        engine.set_target_position(inst.clone(), 200.0);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        assert!((engine.isolated_balance(&inst) - 2_000.0).abs() < 1e-9);
+
+        engine.begin_bar(10.0, inst.clone());
+        let events = engine.check_margin();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, LiquidateReason::Depleted);
+        assert_eq!(events[0].reduced_qty, 200.0);
+        assert_eq!(engine.get_position(&inst), 0.0);
+        assert_eq!(engine.isolated_balance(&inst), 0.0);
+
+        // 穿仓缺口 = 开仓手续费 200 + 强平费 8 + 名义亏损 198_000 - 本金 100_000
+        assert_eq!(engine.insurance_fund_loss, 98_208.0);
+        assert_eq!(
+            engine.compute_nav(Timestamp::from_nanos(0), 0.0),
+            0.0,
+            "穿仓后 NAV 必须被写回 0,不能为负"
         );
     }
 

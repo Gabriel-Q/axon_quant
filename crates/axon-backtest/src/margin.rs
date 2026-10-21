@@ -212,16 +212,15 @@ impl MarginTracker {
     /// **必须在每档减仓后调用**：不释放多余保证金，下一 bar 的 `equity`
     /// 仍按旧保证金计算，会再次判定爆仓 → 连锁误强平（设计 §2.3 的关键点）。
     ///
-    /// 返回穿仓兜底额（>= 0）：子账户不足以覆盖剩余保证金需求时，缺口按
-    /// 保险基金口径记账，由调用方累加到 `insurance_fund_loss`。
-    pub fn settle_after_reduce(&mut self, symbol: &str, remaining_notional: f64, fee: f64) -> f64 {
+    /// 这里只负责把子账户压到"剩余名义所需保证金"，不处理穿仓缺口：
+    /// 缺口统一由引擎在强平结束后按账户级 NAV 口径兜底，避免两处重复计入
+    /// `insurance_fund_loss`。
+    pub fn settle_after_reduce(&mut self, symbol: &str, remaining_notional: f64, fee: f64) {
         let required = self.required_isolated(symbol, remaining_notional);
         let after_fee = self.isolated(symbol) - fee.max(0.0);
         // 子账户只保留"剩余名义所需保证金"；负数按 0 处理，不会留负余额
         let kept = after_fee.max(0.0).min(required);
-        let written_off = (required - after_fee).max(0.0);
         self.set_isolated(symbol, kept);
-        written_off
     }
 
     /// 每品种规格（只读）
