@@ -27,7 +27,7 @@
 //! - auto_rebalance_threshold 默认 1e-6，避免目标无意义抖动也触发撮合
 //! - RunResult 聚合所有 fill/order 统计 + NAV 曲线（bar_nav_curve 每 bar 一帧）
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axon_backtest::L1MatchingEngine;
@@ -277,6 +277,14 @@ impl BacktestRunner {
                 }
             }
 
+            // 4b-1) 上一根 bar 被强平的品种快照（在 4c 的自动 rebalance 之前取）：
+            // 引擎已把 leg 目标清零，这里再挡住 Hold 决策把旧目标原样写回去。
+            let liquidated_before = if margin_enabled {
+                engine.liquidated_symbols().clone()
+            } else {
+                HashSet::new()
+            };
+
             // 4c) begin_bar_multi：只含已有价格的 instrument（尚未上市者不参与）
             let legs: Vec<(Instrument, f64)> = unique_symbols
                 .iter()
@@ -323,8 +331,13 @@ impl BacktestRunner {
 
                 if let Ok(ref dec) = decision {
                     let target = if dec.action == axon_llm::decision::Action::Hold {
-                        // Hold：沿用上次生效目标（含约束缩放结果），而非策略自报值
-                        *effective_targets.get(sym).unwrap_or(&0.0)
+                        if liquidated_before.contains(&instrument_key_for(sym)) {
+                            // 刚被强平的品种不能靠 Hold 沿用旧目标复活
+                            0.0
+                        } else {
+                            // Hold：沿用上次生效目标（含约束缩放结果），而非策略自报值
+                            *effective_targets.get(sym).unwrap_or(&0.0)
+                        }
                     } else {
                         dec.target_position
                             .unwrap_or_else(|| action_to_target(dec.action))
@@ -455,6 +468,24 @@ fn action_to_target(act: axon_llm::decision::Action) -> f64 {
         Sell => -1.0,
         Hold => 0.0,
     }
+}
+
+/// 把 "BTCUSDT" / "BTC-USDT" 归一化为引擎/保证金模块使用的 "BTC/USDT"
+///
+/// 与 QuantCell `_normalize_symbol` 同规则：已有分隔符原样保留，否则去掉
+/// "-"/"_" 后按已知计价币后缀切分（长的优先，避免 USDC 被 USD 抢先截断）。
+fn instrument_key_for(sym: &str) -> String {
+    let s = sym.to_uppercase();
+    if s.contains('/') {
+        return s;
+    }
+    let s = s.replace(['-', '_'], "");
+    for quote in ["USDT", "USDC", "USD", "BTC", "ETH"] {
+        if s.ends_with(quote) && s.len() > quote.len() {
+            return format!("{}/{}", &s[..s.len() - quote.len()], quote);
+        }
+    }
+    s
 }
 
 // ── 结果类型 ── //
@@ -980,6 +1011,93 @@ mod tests {
             shared.total_pnl,
             expected,
             shared.total_pnl - expected
+        );
+    }
+
+    /// 第一根 bar 开仓、随后暴跌被强平、之后一直 Hold：仓位不得被 Hold 复活
+    #[tokio::test]
+    async fn hold_after_liquidation_does_not_resurrect_position() {
+        struct OpenThenHold {
+            symbol: String,
+        }
+
+        #[async_trait::async_trait]
+        impl Strategy for OpenThenHold {
+            fn name(&self) -> &str {
+                "open_then_hold"
+            }
+
+            fn symbol(&self) -> &str {
+                &self.symbol
+            }
+
+            async fn decide(
+                &self,
+                ctx: &BarContext<'_>,
+            ) -> Result<StrategyDecision, axon_strategy::trait_::StrategyError> {
+                use axon_llm::decision::Action;
+                if ctx.bar_index == 0 {
+                    Ok(StrategyDecision::from_rule(Action::Buy).with_target_position(50.0))
+                } else {
+                    Ok(StrategyDecision::from_rule(Action::Hold))
+                }
+            }
+        }
+
+        // 首根 100 开仓，第二根直接跌到 1 → 20x 全仓深度穿仓，之后维持 1
+        let closes = [100.0, 1.0, 1.0, 1.0];
+        let bars: Vec<Option<Bar>> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, &close)| {
+                Some(Bar {
+                    timestamp: Timestamp::from_secs(i as i64 * 60),
+                    open: Price::from_f64(close),
+                    high: Price::from_f64(close),
+                    low: Price::from_f64(close),
+                    close: Price::from_f64(close),
+                    volume: Quantity::from_f64(1000.0),
+                })
+            })
+            .collect();
+        let bars_by_symbol = BTreeMap::from([("LTC/USDT".to_string(), bars)]);
+        let states = BTreeMap::from([(
+            "LTC/USDT".to_string(),
+            vec![serde_json::Value::Null; closes.len()],
+        )]);
+
+        let spec = MarginSpec {
+            leverage: 20.0,
+            mode: axon_backtest::MarginMode::Cross,
+            brackets: vec![axon_backtest::Bracket {
+                notional_floor: 0.0,
+                notional_cap: None,
+                mmr: 0.004,
+                cum: 0.0,
+                liquidation_fee_rate: 0.001,
+                max_leverage: 125.0,
+            }],
+            bracket_source: "default".into(),
+        };
+        let mut runner = BacktestRunner::simple(1_000.0)
+            .with_futures(SwapSettle::UsdMargin, 1.0)
+            .with_margin(HashMap::from([("LTC/USDT".to_string(), spec)]));
+        runner.add_strategy(Arc::new(OpenThenHold {
+            symbol: "LTC/USDT".into(),
+        }));
+
+        let result = runner
+            .run(&bars_by_symbol, &states, &BTreeMap::new(), None)
+            .await;
+
+        assert!(
+            !result.liquidation_events.is_empty(),
+            "暴跌必须产生强平事件"
+        );
+        assert!(
+            result.final_positions.is_empty(),
+            "强平后 Hold 不得把旧目标复活，终态持仓应为空：{:?}",
+            result.final_positions
         );
     }
 }

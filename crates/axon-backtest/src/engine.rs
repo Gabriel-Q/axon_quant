@@ -18,7 +18,7 @@
 //!   价格调整由 `ImpactedMatchingEngine` 在更高层包装完成
 //! - 单一回测任务单线程执行（事件驱动串行），不引入额外锁
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -669,6 +669,11 @@ pub struct BacktestEngine {
     /// 只统计"想开但开不起"的次数,用于结果回显（前端提示"部分开仓受
     /// 可用保证金限制"）；不影响已成交部分的口径。
     margin_shortfall_count: u32,
+    /// 上一次 `check_margin` 中被强平的品种（"BASE/QUOTE"）
+    ///
+    /// `check_margin` 每次开头清空,只保留"最近一次检查"的结果；worker 在
+    /// 下一根 bar 用它阻止 Hold 决策把刚被清掉的仓位原样开回来。
+    liquidated_last_bar: HashSet<String>,
 }
 
 impl std::fmt::Debug for BacktestEngine {
@@ -779,6 +784,7 @@ impl BacktestEngine {
             insurance_fund_loss: 0.0,
             liquidation_events: Vec::new(),
             margin_shortfall_count: 0,
+            liquidated_last_bar: HashSet::new(),
         }
     }
 
@@ -2229,6 +2235,9 @@ impl BacktestEngine {
         if self.margin.is_none() {
             return Vec::new();
         }
+        // 只保留最近一次检查的强平品种:worker 在下一根 bar 消费这份快照,
+        // 陈旧数据会让正常品种被误判为"刚被强平"。
+        self.liquidated_last_bar.clear();
         // 0) 先按最新判定价把逐仓子账户补足/释放:否则刚开仓的逐仓品种子账户为 0,
         //    权益只剩浮盈亏,任何微小浮亏都会被误判强平
         self.sync_isolated_margins();
@@ -2258,6 +2267,11 @@ impl BacktestEngine {
             if filled == 0 {
                 continue;
             }
+            // 强平后把目标位清零：否则下一根 bar 的 begin_bar 会按旧 target 原样开回来
+            if let Some(leg) = self.bt_state.legs.get_mut(&inst) {
+                leg.target_position = 0.0;
+            }
+            self.liquidated_last_bar.insert(act.symbol.clone());
             let after_qty = self.get_position(&inst);
             let reduced_qty = (before_qty - after_qty).abs();
             let fee = reduced_qty * price * act.fee_rate;
@@ -2316,6 +2330,14 @@ impl BacktestEngine {
     /// 因可用自由余额不足而被缩量的逐仓开仓次数（供结果层 Task 6 透出）
     pub fn margin_shortfall_count(&self) -> u32 {
         self.margin_shortfall_count
+    }
+
+    /// 上一次保证金检查中被强平的品种（"BASE/QUOTE"）
+    ///
+    /// 编排层在下一根 bar 用它区分"策略主动开仓"与"Hold 沿用旧目标"，
+    /// 避免刚被强平的品种在同 bar 被原样开回来。
+    pub fn liquidated_symbols(&self) -> &HashSet<String> {
+        &self.liquidated_last_bar
     }
 
     /// 把 tracker 的 "BASE/QUOTE" 字符串映射回引擎内部 `Instrument`
@@ -6008,6 +6030,33 @@ mod tests {
         let _ = engine.check_margin();
         assert!(engine.nav_for_test() >= 0.0);
         assert!(engine.insurance_fund_loss > 0.0);
+    }
+
+    /// 强平后记录品种并把 leg 目标清零，防止下一根 bar 按旧目标重开
+    #[test]
+    fn liquidated_symbol_is_recorded_and_target_zeroed() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0);
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(engine.get_position(&inst) > 0.0);
+
+        // 价格从 100 跌到 1：NAV 深度为负，本 bar 必然强平
+        engine.begin_bar(1.0, inst.clone());
+        let events = engine.check_margin();
+        assert!(!events.is_empty(), "暴跌应产生强平事件");
+        assert!(
+            engine.liquidated_symbols().contains("LTC/USDT"),
+            "强平品种必须进入 liquidated_symbols"
+        );
+        assert_eq!(
+            engine.get_target_position(&inst),
+            Some(0.0),
+            "强平后 leg 目标必须清零，否则下一根 bar 原样开回来"
+        );
+        assert_eq!(engine.get_position(&inst), 0.0);
     }
 
     /// 受控行情：价格 100 → 98.8（-1.2%，120 根），策略恒定 50% 权益名义仓位。
