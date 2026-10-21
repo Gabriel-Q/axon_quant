@@ -9,12 +9,13 @@
 
 #![cfg(feature = "python")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use axon_backtest::margin::{Bracket, LiquidateReason, LiquidationEvent, MarginMode, MarginSpec};
 use axon_core::market::bar::Bar;
 use axon_core::portfolio::{FillRecord, TradeRecord};
 use axon_core::time::Timestamp;
@@ -87,6 +88,17 @@ pub struct PyBacktestResult {
     pub fills_detail: Vec<FillRecord>,
     /// 终态持仓（自定义 getter → dict[tuple, float]）
     pub final_positions: Vec<(Instrument, f64)>,
+    /// 强平事件时间线（自定义 getter → list[dict]）
+    pub liquidation_events: Vec<LiquidationEvent>,
+    /// 穿仓兜底累计额（保险基金语义）
+    #[pyo3(get)]
+    pub insurance_fund_loss: f64,
+    /// 判定价口径（v1 固定 `"close"`）
+    #[pyo3(get)]
+    pub price_basis: String,
+    /// 是否因启用保证金而停用了 `capital_budget`
+    #[pyo3(get)]
+    pub capital_budget_disabled: bool,
 }
 
 impl From<&BacktestResult> for PyBacktestResult {
@@ -130,6 +142,10 @@ impl From<&BacktestResult> for PyBacktestResult {
             trades: r.trades.clone(),
             fills_detail: r.fills_detail.clone(),
             final_positions: r.final_positions.clone(),
+            liquidation_events: r.liquidation_events.clone(),
+            insurance_fund_loss: r.insurance_fund_loss,
+            price_basis: r.price_basis.clone(),
+            capital_budget_disabled: r.capital_budget_disabled,
         }
     }
 }
@@ -196,6 +212,39 @@ impl PyBacktestResult {
             d.set_item(instrument_to_tuple(py, inst)?, *qty)?;
         }
         Ok(d)
+    }
+
+    /// 强平事件时间线（`list[dict]`，未启用保证金时为空列表）
+    #[getter]
+    fn liquidation_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for e in &self.liquidation_events {
+            let d = PyDict::new(py);
+            d.set_item("timestamp_ns", e.timestamp_ns)?;
+            d.set_item("symbol", &e.symbol)?;
+            d.set_item(
+                "margin_mode",
+                match e.margin_mode {
+                    MarginMode::Isolated => "isolated",
+                    MarginMode::Cross => "cross",
+                },
+            )?;
+            d.set_item("tier_from", e.tier_from)?;
+            d.set_item("tier_to", e.tier_to)?;
+            d.set_item("reduced_qty", e.reduced_qty)?;
+            d.set_item("price", e.price)?;
+            d.set_item("fee", e.fee)?;
+            d.set_item(
+                "reason",
+                match e.reason {
+                    LiquidateReason::Partial => "partial",
+                    LiquidateReason::Depleted => "depleted",
+                },
+            )?;
+            d.set_item("price_basis", e.price_basis)?;
+            list.append(d)?;
+        }
+        Ok(list)
     }
 
     pub fn __repr__(&self) -> String {
@@ -336,6 +385,107 @@ impl PyBacktestRunner {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("BacktestRunner lock 失败: {e}"))
             })?
             .add_strategy(s);
+        Ok(())
+    }
+
+    /// 注入每品种保证金规格（空 dict = 不启用保证金模拟）
+    ///
+    /// 形如：
+    /// ```python
+    /// runner.with_margin({
+    ///     "BTC/USDT": {
+    ///         "leverage": 10.0,
+    ///         "mode": "cross",              # "cross" / "isolated"
+    ///         "brackets": [{"notional_floor": 0.0, "notional_cap": 50000.0,
+    ///                       "mmr": 0.004, "max_leverage": 125.0}],
+    ///     }
+    /// })
+    /// ```
+    fn with_margin(&self, specs: &Bound<'_, PyDict>) -> PyResult<()> {
+        let mut parsed: HashMap<String, MarginSpec> = HashMap::new();
+        for (k, v) in specs.iter() {
+            let sym: String = k.extract()?;
+            let d = v.cast::<PyDict>()?;
+
+            let leverage: f64 = d
+                .get_item("leverage")?
+                .map(|x| x.extract::<f64>())
+                .transpose()?
+                .unwrap_or(1.0);
+            let mode = match d
+                .get_item("mode")?
+                .map(|x| x.extract::<String>())
+                .transpose()?
+                .unwrap_or_else(|| "cross".to_string())
+                .as_str()
+            {
+                "isolated" => MarginMode::Isolated,
+                "cross" => MarginMode::Cross,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown margin mode: {other} (expected 'isolated' / 'cross')"
+                    )));
+                }
+            };
+
+            // brackets 没有默认值：缺档位就无法算维持保证金，宁可直接报错
+            let brackets_obj = d.get_item("brackets")?.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("{sym} 缺少 brackets"))
+            })?;
+            let brackets_list: Vec<Bound<'_, PyAny>> = brackets_obj.extract()?;
+            let mut brackets = Vec::with_capacity(brackets_list.len());
+            for item in brackets_list {
+                let bd = item.cast::<PyDict>()?;
+                brackets.push(Bracket {
+                    notional_floor: bd
+                        .get_item("notional_floor")?
+                        .map(|x| x.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(0.0),
+                    notional_cap: bd
+                        .get_item("notional_cap")?
+                        .map(|x| x.extract::<Option<f64>>())
+                        .transpose()?
+                        .flatten(),
+                    mmr: bd
+                        .get_item("mmr")?
+                        .map(|x| x.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(0.0),
+                    cum: bd
+                        .get_item("cum")?
+                        .map(|x| x.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(0.0),
+                    liquidation_fee_rate: bd
+                        .get_item("liquidation_fee_rate")?
+                        .map(|x| x.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(0.001),
+                    max_leverage: bd
+                        .get_item("max_leverage")?
+                        .map(|x| x.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(125.0),
+                });
+            }
+            parsed.insert(
+                sym,
+                MarginSpec {
+                    leverage,
+                    mode,
+                    brackets,
+                },
+            );
+        }
+
+        // 原地替换：保留已注册策略与 futures 品种配置
+        self.inner
+            .lock()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("BacktestRunner lock 失败: {e}"))
+            })?
+            .set_margin_specs(parsed);
         Ok(())
     }
 
