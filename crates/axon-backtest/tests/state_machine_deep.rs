@@ -313,21 +313,24 @@ fn add_then_reverse_chains_state_machine() {
     );
 }
 
-// ── 测试 2:同向加仓 → 部分反手(|n| < |p|,反向部分平仓) ─────────────────
+// ── 测试 2:同向加仓 → 部分反手 → 完全平仓(FLAT_TO_FLAT 聚合) ─────────────────
 
-/// 6 状态机"反向部分平仓"分支:同向加仓后部分反手,验证 avg_cost 保留
+/// 6 状态机"反向部分平仓"分支:同向加仓后部分反手,再全平剩余
+///
+/// FLAT_TO_FLAT 语义:部分平仓(分支 4)不再立即 push TradeRecord,
+/// 累积到完全平仓(分支 3)时聚合输出。
 ///
 /// 事件流:
 /// - bar 0: buy 0.1 @ 100(开仓)
 /// - bar 1: buy 0.4 @ 110(加仓,avg_cost=108)
-/// - bar 2: sell 0.3 @ 105(|n|=0.3 < |p|=0.5,反向部分平仓)
-///   → 平 0.3 @ 108,realized = (105-108)*0.3 = -0.9
-///   → 留 0.2 @ 108(avg_cost 保留)
+/// - bar 2: sell 0.3 @ 105(|n|=0.3 < |p|=0.5,反向部分平仓,FLAT_TO_FLAT 只累积)
+/// - bar 3: sell 0.2 @ 107(全平剩余 0.2,触发分支 3 聚合 push)
 ///
 /// 关键断言:
-/// - 1 trade(部分平仓 push 1 笔)
-/// - realized_pnl ≈ -0.9 * 1e6
-/// - pos[BTC] = +0.2(仍持 long,数量减少)
+/// - 1 trade(聚合后的 TradeRecord)
+/// - exit_fill_ids 包含两次平仓 fill ids
+/// - 聚合 realized_pnl = (105-108)*0.3 + (107-108)*0.2 = -0.9 + -0.2 = -1.1
+/// - 终态空仓
 #[test]
 fn add_then_partial_reverse() {
     let mut q = EventQueue::new();
@@ -359,7 +362,7 @@ fn add_then_partial_reverse() {
         110.0,
         0.4,
     );
-    // bar 2:sell 0.3 @ 105(部分反手)
+    // bar 2:sell 0.3 @ 105(部分反手,留 0.2,FLAT_TO_FLAT 只累积不 push)
     push_trade(
         &mut q,
         &mut b,
@@ -371,33 +374,41 @@ fn add_then_partial_reverse() {
         105.0,
         0.3,
     );
+    // bar 3:sell 0.2 @ 107(全平剩余 0.2,触发分支 3 聚合 push)
+    push_trade(
+        &mut q,
+        &mut b,
+        4_000,
+        &mut counter_id,
+        &mut strat_id,
+        btc(),
+        Side::Sell,
+        107.0,
+        0.2,
+    );
 
     let mut engine = BacktestEngine::new(multi_symbol_config(), q);
     let result = engine.run();
 
-    // 3 笔 fill
-    assert_eq!(result.fills, 3);
-    // 1 笔 trade(部分平仓 push 1 笔)
+    // 4 笔 fill
+    assert_eq!(result.fills, 4);
+    // FLAT_TO_FLAT:聚合为 1 条 TradeRecord
     assert_eq!(result.trades.len(), 1);
 
     let trade = &result.trades[0];
-    // realized_pnl = (105 - 108) * 0.3 = -0.9
-    let expected_realized = ((105.0 - 108.0) * 0.3 * 1e6) as i64;
-    let realized_diff = (trade.realized_pnl - expected_realized).abs();
+    // 聚合 realized_pnl = (105-108)*0.3 + (107-108)*0.2 = -0.9 + -0.2 = -1.1
+    let expected_realized = ((105.0 - 108.0) * 0.3 + (107.0 - 108.0) * 0.2) * 1e6;
+    let realized_diff = (trade.realized_pnl - expected_realized as i64).abs();
     assert!(
         realized_diff < 1_000,
-        "realized_pnl 应≈{}, got {}",
+        "聚合 realized_pnl 应≈{}, got {}",
         expected_realized,
         trade.realized_pnl
     );
-
-    // 末态持仓 = +0.2(部分平仓,剩 0.2 long)
-    let pos = result.positions.get(&btc_inst()).copied().unwrap_or(0.0);
-    assert!(
-        (pos - 0.2).abs() < 1e-9,
-        "末态持仓应为 +0.2(部分平仓), got {}",
-        pos
-    );
+    // exit_fill_ids 包含两次平仓 fill ids
+    assert_eq!(trade.exit_fill_ids.len(), 2);
+    // 终态空仓
+    assert_eq!(result.positions.len(), 0);
 }
 
 // ── 测试 3:浮点 1e-12 边界被路由到"完全平仓"分支 ────────────────────

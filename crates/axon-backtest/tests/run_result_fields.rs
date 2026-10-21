@@ -344,9 +344,12 @@ fn win_rate_mixed_pnl() {
     );
 }
 
-// ─── 测试 5: 反向部分平仓 + 反手(6 状态机分支) ──────────────────────
+// ─── 测试 5: 反向部分平仓 + 完全平仓(FLAT_TO_FLAT 聚合) ──────────────────────
 
-/// 反向部分平仓:Long 0.2 → Sell 0.1 → 平 0.1 + 留 0.1
+/// 反向部分平仓 → 全平:Long 0.2 → Sell 0.1(部分平,留 0.1) → Sell 0.1(全平)
+///
+/// FLAT_TO_FLAT 语义:部分平仓不再立即 push TradeRecord,
+/// 跨 partial close 累积到完全平仓时聚合为 1 条 TradeRecord。
 #[test]
 fn reverse_partial_close() {
     let mut q = EventQueue::new();
@@ -364,42 +367,53 @@ fn reverse_partial_close() {
         2,
         OrderAction::Submitted(make_limit_order(2, Side::Buy, 100.0, 0.2)),
     ));
-    // 3) Buy @ 105 qty=0.1 (挂单,做平仓对手方)
+    // 3) Buy @ 105 qty=0.1 (挂单,部分平仓对手方)
     q.push(b.order(
         Timestamp::from_nanos(3_000),
         3,
         OrderAction::Submitted(make_limit_order(3, Side::Buy, 105.0, 0.1)),
     ));
     // 4) Sell @ 105 qty=0.1 (吃单) → 反向部分平仓:close 0.1,留 0.1
+    //    FLAT_TO_FLAT:此时**不 push** TradeRecord,只累积 pending_close_fills
     q.push(b.order(
         Timestamp::from_nanos(4_000),
         4,
         OrderAction::Submitted(make_limit_order(4, Side::Sell, 105.0, 0.1)),
     ));
+    // 5) Buy @ 110 qty=0.1 (挂单,全平对手方)
+    q.push(b.order(
+        Timestamp::from_nanos(5_000),
+        5,
+        OrderAction::Submitted(make_limit_order(5, Side::Buy, 110.0, 0.1)),
+    ));
+    // 6) Sell @ 110 qty=0.1 (吃单) → 全平剩余 0.1,触发分支 3 聚合 push
+    q.push(b.order(
+        Timestamp::from_nanos(6_000),
+        6,
+        OrderAction::Submitted(make_limit_order(6, Side::Sell, 110.0, 0.1)),
+    ));
 
     let mut engine = BacktestEngine::new(simple_config(), q);
     let result = engine.run();
 
-    // 反向部分平仓 push 1 笔 TradeRecord
+    // FLAT_TO_FLAT:两次平仓 fill 聚合为 1 条 TradeRecord
     assert_eq!(
         result.trades.len(),
         1,
-        "反向部分平仓应 push 1 个 TradeRecord"
+        "完全平仓后应 push 1 个聚合 TradeRecord,got {}",
+        result.trades.len()
     );
-    // realized_pnl = (105-100) * 0.1 = 0.5
+    // 聚合 realized_pnl = (105-100)*0.1 + (110-100)*0.1 = 0.5 + 1.0 = 1.5
     let tr = &result.trades[0];
     assert!(
-        (tr.realized_pnl - 500_000).abs() < 1,
-        "expected realized_pnl=500_000, got {}",
+        (tr.realized_pnl - 1_500_000).abs() < 1,
+        "expected aggregated realized_pnl=1_500_000, got {}",
         tr.realized_pnl
     );
-    // 终态:Long 0.1(还剩一半)
-    assert_eq!(result.positions.len(), 1);
-    assert!(
-        (result.positions[&btc_inst()] - 0.1).abs() < 1e-9,
-        "expected position=0.1, got {}",
-        result.positions[&btc_inst()]
-    );
+    // exit_fill_ids 包含两次平仓 fill ids
+    assert_eq!(tr.exit_fill_ids.len(), 2, "应包含两次平仓 fill ids");
+    // 终态:空仓
+    assert_eq!(result.positions.len(), 0);
 }
 
 /// 反手:Long 0.1 → Sell 0.2 → 平 0.1 + 开反向 0.1

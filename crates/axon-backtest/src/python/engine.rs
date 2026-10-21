@@ -888,9 +888,9 @@ impl PyRunResult {
             // T0.17 新增:开仓均价(f64)与首次开仓时间(纳秒)
             d.set_item("entry_price", tr.entry_price as f64 / 1e6)?;
             d.set_item("entry_time_ns", tr.entry_time_ns)?;
-            // 开仓 fill id 列表(同向加仓多条)与触发平仓的 fill id,供 Python 侧关联 fills_detail
+            // 开仓 fill id 列表(同向加仓多条)与平仓 fill ids 列表(FLAT_TO_FLAT 聚合),供 Python 侧关联 fills_detail
             d.set_item("entry_fill_ids", tr.entry_fill_ids.clone())?;
-            d.set_item("exit_fill_id", tr.exit_fill_id)?;
+            d.set_item("exit_fill_ids", tr.exit_fill_ids.clone())?;
             list.append(d)?;
         }
         Ok(list)
@@ -913,7 +913,7 @@ impl PyRunResult {
     /// - `taker_side`:str("Buy" / "Sell")
     /// - `price`:float
     /// - `quantity`:float
-    /// - `fill_id`:int(全局唯一,等于本 list 下标;可被 `trades` 的 `entry_fill_ids`/`exit_fill_id` 引用)
+    /// - `fill_id`:int(全局唯一,等于本 list 下标;可被 `trades` 的 `entry_fill_ids`/`exit_fill_ids` 引用)
     #[getter]
     fn fills_detail<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);

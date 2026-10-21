@@ -456,6 +456,11 @@ struct PositionState {
     entry_fee: f64,
     /// 当前持仓由哪些开仓 fill 构成（状态1起头、状态2追加、平仓时读后清空）
     open_fill_ids: Vec<u32>,
+    // ── FLAT_TO_FLAT: 跨 partial close 累积平仓状态 ──
+    pending_close_fills: Vec<u32>,
+    cumulative_close_qty: f64,
+    cumulative_close_commission: f64,
+    cumulative_close_pnl: f64,
 }
 
 /// 回测运行时状态(Stage 3 阶段 B 新增,封装在 `BacktestEngine` 内部)
@@ -684,12 +689,16 @@ pub struct BacktestEngine {
     margin: Option<MarginTracker>,
     /// 累计穿仓兜底额(保险基金语义)
     insurance_fund_loss: f64,
+    /// 账户是否已穿仓冻结:一旦保险基金把 NAV 从负值抬回 0 就置位,
+    /// 此后禁止再开新仓/加仓(只允许减仓),避免"零权益反复开仓→强平→兜底"的死循环
+    frozen: bool,
     /// 强平事件时间线(每 bar 检查产出的事件累积到这里)
     liquidation_events: Vec<LiquidationEvent>,
-    /// 因可用自由余额不足而被缩量的逐仓开仓次数
+    /// 因可用保证金不足而被缩量的开仓次数
     ///
     /// 只统计"想开但开不起"的次数,用于结果回显（前端提示"部分开仓受
-    /// 可用保证金限制"）；不影响已成交部分的口径。
+    /// 可用保证金限制"）；不影响已成交部分的口径。逐仓看自由现金，
+    /// 全仓看 NAV − 已占用初始保证金。
     margin_shortfall_count: u32,
     /// 上一次 `check_margin` 中被强平的品种（"BASE/QUOTE"）
     ///
@@ -804,6 +813,7 @@ impl BacktestEngine {
             // 保证金默认未启用:tracker 为 None,check_margin 直接返回空
             margin,
             insurance_fund_loss: 0.0,
+            frozen: false,
             liquidation_events: Vec::new(),
             margin_shortfall_count: 0,
             liquidated_last_bar: HashSet::new(),
@@ -1679,6 +1689,10 @@ impl BacktestEngine {
                 pos.entry_time_ns = timestamp.nanos;
                 pos.side = Some(side);
                 pos.open_fill_ids = vec![fill_id];
+                pos.pending_close_fills.clear();
+                pos.cumulative_close_qty = 0.0;
+                pos.cumulative_close_commission = 0.0;
+                pos.cumulative_close_pnl = 0.0;
             }
             // (2) 同向加仓 (sign same, p≠0)
             (p, n) if p.signum() == n.signum() && p != 0.0 => {
@@ -1694,14 +1708,23 @@ impl BacktestEngine {
                 // 读后清空：这批开仓 fill 归属本笔平仓 trade
                 let entry_fill_ids = std::mem::take(&mut pos.open_fill_ids);
                 let close_qty = p.abs();
-                let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
-                pos.realized_pnl += pnl;
+                let this_pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
+                pos.realized_pnl += this_pnl;
                 self.bt_state
                     .trading_metrics
-                    .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                    .record_trade((this_pnl * 1e6) as i64, (fee * 1e6) as i64);
                 // 开仓均价/时间必须在清仓前读取(avg_cost 会被置 0)
                 let entry_price = (pos.avg_cost * 1e6) as i64;
                 let entry_time_ns = pos.entry_time_ns;
+                // FLAT_TO_FLAT:聚合跨 partial close 的平仓 fill ids 与累计指标
+                let exit_fill_ids = {
+                    let mut v = std::mem::take(&mut pos.pending_close_fills);
+                    v.push(fill_id);
+                    v
+                };
+                let total_close_qty = pos.cumulative_close_qty + close_qty;
+                let total_pnl = pos.cumulative_close_pnl + this_pnl;
+                let total_fee = pos.cumulative_close_commission + fee;
                 let trade = Trade::new(
                     timestamp,
                     fill.price,
@@ -1711,14 +1734,14 @@ impl BacktestEngine {
                 );
                 self.bt_state.trades.push(TradeRecord::new(
                     trade,
-                    (pnl * 1e6) as i64,
-                    (fee * 1e6) as i64,
-                    (n * 1e6) as i64,
+                    (total_pnl * 1e6) as i64,
+                    (total_fee * 1e6) as i64,
+                    (total_close_qty * n.signum() * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
                     entry_fill_ids,
-                    fill_id,
+                    exit_fill_ids,
                 ));
                 // 清仓
                 pos.quantity = 0.0;
@@ -1726,43 +1749,31 @@ impl BacktestEngine {
                 pos.entry_price = 0.0;
                 pos.entry_fee = 0.0;
                 pos.side = None;
+                pos.cumulative_close_qty = 0.0;
+                pos.cumulative_close_commission = 0.0;
+                pos.cumulative_close_pnl = 0.0;
             }
             // (4) 反向部分平仓 (sign diff, |n| < |p|):用 |n| 平掉一部分旧仓,留 p+n
+            //
+            // FLAT_TO_FLAT:不再每部分平仓都 push TradeRecord。
+            // 改为只把 fill_id 追加到 pending_close_fills、累计 close_qty/pnl/fee,
+            // 等分支 (3) 完全平仓或分支 (5) 反手时一次性聚合成一条 TradeRecord。
             //
             // ponytail:修复 #R-04 — 之前 `close_qty = p.abs()` 错误地把旧仓全平,
             // 跟"完全平仓"分支语义重叠;正确语义是"反向 fill 一部分只平一部分"。
             // 终态 `pos.quantity = p + n`,方向同 n,幅值 = |p| - |n|。
             (p, n) if p.signum() != n.signum() && n.abs() < p.abs() => {
-                // 共享归属：不清空，剩余仓位仍由这批开仓 fill 构成
-                let entry_fill_ids = pos.open_fill_ids.clone();
                 let close_qty = n.abs();
-                let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
-                pos.realized_pnl += pnl;
+                let this_pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
+                pos.realized_pnl += this_pnl;
                 self.bt_state
                     .trading_metrics
-                    .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
-                // 部分平仓:开仓均价/时间取自当前持仓(avg_cost 未被清)
-                let entry_price = (pos.avg_cost * 1e6) as i64;
-                let entry_time_ns = pos.entry_time_ns;
-                // 平仓的 TradeRecord(净量 = n,即本次 fill 方向)
-                let close_trade = Trade::new(
-                    timestamp,
-                    fill.price,
-                    Quantity::from_f64(close_qty),
-                    fill.maker_order_id,
-                    fill.taker_order_id,
-                );
-                self.bt_state.trades.push(TradeRecord::new(
-                    close_trade,
-                    (pnl * 1e6) as i64,
-                    (fee * 1e6) as i64,
-                    (n * 1e6) as i64,
-                    instrument.clone(), // T2.4 新增
-                    entry_price,
-                    entry_time_ns,
-                    entry_fill_ids,
-                    fill_id,
-                ));
+                    .record_trade((this_pnl * 1e6) as i64, (fee * 1e6) as i64);
+                // FLAT_TO_FLAT:不 push TradeRecord,只累积
+                pos.pending_close_fills.push(fill_id);
+                pos.cumulative_close_qty += close_qty;
+                pos.cumulative_close_pnl += this_pnl;
+                pos.cumulative_close_commission += fee;
                 // 留 p+n(同 n 方向,幅值 = |p|-|n|)
                 pos.quantity = p + n;
                 // 平均成本不变(没加新仓,只是减仓)
@@ -1772,14 +1783,23 @@ impl BacktestEngine {
                 // 旧仓的开仓 fill 归属本笔旧 trade；本次 fill 同时充当新仓开仓 fill
                 let old_fill_ids = std::mem::take(&mut pos.open_fill_ids);
                 let close_qty = p.abs();
-                let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
-                pos.realized_pnl += pnl;
+                let this_pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
+                pos.realized_pnl += this_pnl;
                 self.bt_state
                     .trading_metrics
-                    .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                    .record_trade((this_pnl * 1e6) as i64, (fee * 1e6) as i64);
                 // 反手:平掉旧仓的开仓均价/时间取自旧持仓(反手后会被新仓覆盖)
                 let entry_price = (pos.avg_cost * 1e6) as i64;
                 let entry_time_ns = pos.entry_time_ns;
+                // FLAT_TO_FLAT:旧仓 exit_fill_ids = pending_close_fills + 反手 fill_id
+                let exit_fill_ids = {
+                    let mut v = std::mem::take(&mut pos.pending_close_fills);
+                    v.push(fill_id);
+                    v
+                };
+                let total_close_qty = pos.cumulative_close_qty + close_qty;
+                let total_pnl = pos.cumulative_close_pnl + this_pnl;
+                let total_fee = pos.cumulative_close_commission + fee;
                 let close_trade = Trade::new(
                     timestamp,
                     fill.price,
@@ -1787,16 +1807,17 @@ impl BacktestEngine {
                     fill.maker_order_id,
                     fill.taker_order_id,
                 );
+                // 旧仓 net_quantity = -total_close_qty * p.signum()
                 self.bt_state.trades.push(TradeRecord::new(
                     close_trade,
-                    (pnl * 1e6) as i64,
-                    (fee * 1e6) as i64,
-                    (-p * 1e6) as i64,
+                    (total_pnl * 1e6) as i64,
+                    (total_fee * 1e6) as i64,
+                    (-total_close_qty * p.signum() * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
                     old_fill_ids,
-                    fill_id,
+                    exit_fill_ids,
                 ));
                 // 开反向 n + p
                 pos.quantity = n + p;
@@ -1806,6 +1827,10 @@ impl BacktestEngine {
                 pos.entry_time_ns = timestamp.nanos;
                 pos.side = Some(side);
                 pos.open_fill_ids = vec![fill_id];
+                pos.pending_close_fills.clear();
+                pos.cumulative_close_qty = 0.0;
+                pos.cumulative_close_commission = 0.0;
+                pos.cumulative_close_pnl = 0.0;
             }
             // 不应到达 — 防御性兜底
             _ => {}
@@ -2344,14 +2369,25 @@ impl BacktestEngine {
         if nav < 0.0 {
             self.bt_state.cash += -nav;
             self.insurance_fund_loss += -nav;
+            // 账户已穿仓:保险基金兜底之后立即冻结,否则策略会在 0 权益上继续
+            // 开仓→强平→兜底,产生一串"僵尸交易"与无上限的保险基金损失。
+            self.frozen = true;
         }
 
         events
     }
 
-    /// 因可用自由余额不足而被缩量的逐仓开仓次数（供结果层 Task 6 透出）
+    /// 因可用保证金不足而被缩量的开仓次数（供结果层 Task 6 透出）
     pub fn margin_shortfall_count(&self) -> u32 {
         self.margin_shortfall_count
+    }
+
+    /// 账户是否已穿仓冻结（保险基金兜底后置位，冻结后只允许减仓）
+    ///
+    /// 编排层据此停止策略决策：让已经破产的账户继续交易只会产出
+    /// 一串"同一根 bar 开仓又强平"的僵尸记录。
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     /// 上一次保证金检查中被强平的品种（"BASE/QUOTE"）
@@ -2465,6 +2501,11 @@ impl BacktestEngine {
             // 逐仓开仓/加仓：所需保证金必须由自由余额支撑，不足则缩量，
             // 避免保证金划转把 cash 扣成负数（减仓方向不受此限制）。
             let increasing = current.abs() < 1e-12 || delta.signum() == current.signum();
+            // 穿仓冻结后只允许减仓：任何开仓/加仓一律拒绝，避免在 0 权益上
+            // 反复开仓→强平→保险基金兜底
+            if self.frozen && increasing {
+                continue;
+            }
             if increasing && self.is_margined(&instrument) {
                 let sym = instrument_key(&instrument);
                 let margin_info = self.margin.as_ref().map(|t| {
@@ -2476,7 +2517,7 @@ impl BacktestEngine {
                             .unwrap_or(1.0),
                     )
                 });
-                if let Some((MarginMode::Isolated, leverage)) = margin_info {
+                if let Some((mode, leverage)) = margin_info {
                     let price = self
                         .bt_state
                         .bar_mid_by_instrument
@@ -2484,11 +2525,53 @@ impl BacktestEngine {
                         .copied()
                         .unwrap_or(0.0);
                     if price > 0.0 {
-                        // 可用现金要同时覆盖"保证金占用 + 手续费"：只按名义/杠杆
+                        // 可用资金要同时覆盖"保证金占用 + 手续费"：只按名义/杠杆
                         // 缩量会在成交价略高于 mid 时把 cash 压成负数。
                         let fee_rate = self.config.fee_config.taker_rate;
-                        let affordable =
-                            self.bt_state.cash.max(0.0) / (price * (1.0 / leverage + fee_rate));
+                        let affordable = match mode {
+                            // 逐仓：可用额是该子账户之外的自由现金
+                            MarginMode::Isolated => {
+                                self.bt_state.cash.max(0.0) / (price * (1.0 / leverage + fee_rate))
+                            }
+                            // 全仓：可用保证金 = NAV − 已占用的初始保证金。
+                            // ponytail: 初始保证金按 notional/leverage 估算，未按档位表
+                            // 逐档取 IMR（档位只影响维持保证金/强平口径），需要精确 IM
+                            // 时升级为 per-bracket initial rate。
+                            MarginMode::Cross => {
+                                let used_im: f64 = self
+                                    .bt_state
+                                    .position_states
+                                    .iter()
+                                    .filter(|(inst, pos)| {
+                                        pos.quantity.abs() >= 1e-12
+                                            && self.is_margined(inst)
+                                            && self
+                                                .margin
+                                                .as_ref()
+                                                .map(|t| {
+                                                    t.mode_of(&instrument_key(inst))
+                                                        == MarginMode::Cross
+                                                })
+                                                .unwrap_or(false)
+                                    })
+                                    .map(|(inst, pos)| {
+                                        let lev = self
+                                            .margin
+                                            .as_ref()
+                                            .and_then(|t| {
+                                                t.specs()
+                                                    .get(&instrument_key(inst))
+                                                    .map(|s| s.leverage.max(1.0))
+                                            })
+                                            .unwrap_or(1.0);
+                                        pos.quantity.abs() * self.judged_price(inst, pos.avg_cost)
+                                            / lev
+                                    })
+                                    .sum();
+                                let nav = self.compute_nav(self.config.clock.now(), price);
+                                (nav - used_im).max(0.0) / (price * (1.0 / leverage + fee_rate))
+                            }
+                        };
                         if qty > affordable {
                             qty = affordable.max(0.0);
                             self.margin_shortfall_count += 1;
@@ -5403,7 +5486,7 @@ mod tests {
 
     // ── 0.21.0 新增:apply_fill 维护 open_fill_ids 并写入 trade ─────
 
-    /// 状态 1（开仓）+ 状态 3（全平）：entry_fill_ids=[0], exit_fill_id=1
+    /// 状态 1（开仓）+ 状态 3（全平）：entry_fill_ids=[0], exit_fill_ids=[1]
     #[test]
     fn test_apply_fill_tracks_open_fill_ids() {
         let mut q = EventQueue::new();
@@ -5436,7 +5519,7 @@ mod tests {
         assert_eq!(result.fills_detail[1].fill_id, 1);
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
-        assert_eq!(result.trades[0].exit_fill_id, 1);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1]);
     }
 
     /// 状态 2（同向加仓）：两笔开仓 fill 都进 entry_fill_ids
@@ -5481,10 +5564,10 @@ mod tests {
         let result = BacktestEngine::new(simple_config(), q).run();
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].entry_fill_ids, vec![0, 1]);
-        assert_eq!(result.trades[0].exit_fill_id, 2);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![2]);
     }
 
-    /// 状态 4（部分平仓）：两笔平仓 trade 共享同一组开仓 fill ids
+    /// FLAT_TO_FLAT：开多 2 → 部分平 1 → 全平 1，只输出 1 条聚合 TradeRecord
     #[test]
     fn test_apply_fill_partial_close_shares_entry_fill_ids() {
         let mut q = EventQueue::new();
@@ -5524,15 +5607,15 @@ mod tests {
         ));
 
         let result = BacktestEngine::new(simple_config(), q).run();
-        assert_eq!(result.trades.len(), 2);
-        // 两笔平仓 trade 共享开仓 fill 0（avg_cost 口径，不做逐手归因）
+        // FLAT_TO_FLAT: 只聚合输出 1 条 TradeRecord
+        assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
-        assert_eq!(result.trades[0].exit_fill_id, 1);
-        assert_eq!(result.trades[1].entry_fill_ids, vec![0]);
-        assert_eq!(result.trades[1].exit_fill_id, 2);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1, 2]);
+        // 聚合净量 = -2 (平多),单位 ×1e6
+        assert_eq!(result.trades[0].net_quantity, -2_000_000);
     }
 
-    /// 状态 5（反手）：同一 fill 既是旧 trade 的 exit_fill_id，又是新仓的 open fill
+    /// 状态 5（反手）：同一 fill 既是旧 trade 的 exit_fill_ids 元素，又是新仓的 open fill
     #[test]
     fn test_apply_fill_reversal_fill_spans_both_cycles() {
         let mut q = EventQueue::new();
@@ -5575,10 +5658,113 @@ mod tests {
         assert_eq!(result.trades.len(), 2);
         // 旧多头：开仓 fill 0，平仓（反手）fill 1
         assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
-        assert_eq!(result.trades[0].exit_fill_id, 1);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1]);
         // 新空头：开仓 fill 复用反手那笔 fill 1
         assert_eq!(result.trades[1].entry_fill_ids, vec![1]);
-        assert_eq!(result.trades[1].exit_fill_id, 2);
+        assert_eq!(result.trades[1].exit_fill_ids, vec![2]);
+    }
+
+    // ── FLAT_TO_FLAT 新增测试 ──────────────────────────
+
+    /// 开多 1 @ 100 → 部分平 0.5 @ 110 (pnl=5) → 平剩余 0.5 @ 120 (pnl=10)
+    /// 应聚合为 1 条 TradeRecord,realized_pnl=15_000_000,exit_fill_ids=[1,2]
+    #[test]
+    fn test_flat_to_flat_cumulative_pnl() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0: 开多 1 @ 100
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1: 部分平 0.5 @ 110 (pnl=(110-100)*0.5*1=5)
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 110.0, 0.5)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 110.0, 0.5)),
+        ));
+        // fill 2: 平剩余 0.5 @ 120 (pnl=(120-100)*0.5*1=10)
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Buy, 120.0, 0.5)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Sell, 120.0, 0.5)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 1);
+        let t = &result.trades[0];
+        assert_eq!(t.entry_fill_ids, vec![0]);
+        assert_eq!(t.exit_fill_ids, vec![1, 2]);
+        assert_eq!(t.realized_pnl, 15_000_000); // 5+10
+        assert_eq!(t.net_quantity, -1_000_000); // 平多 1
+    }
+
+    /// 开多 1 → 反手 fill（平多 1 + 开空 1）→ 平空 1
+    /// trades.len()=2,旧多头 exit_fill_ids=[反手 fill],新空头 exit_fill_ids=[平空 fill]
+    #[test]
+    fn test_flat_to_flat_reversal_splits_fill() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0: 开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1: Buy 2 挂簿 + Sell 2 吃单 → 平多 1 并反手开空 1
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+        // fill 2: 平掉反手后的空头
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 2);
+        // 旧多头
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1]);
+        assert_eq!(result.trades[0].net_quantity, -1_000_000); // 平多
+        // 新空头
+        assert_eq!(result.trades[1].entry_fill_ids, vec![1]);
+        assert_eq!(result.trades[1].exit_fill_ids, vec![2]);
+        assert_eq!(result.trades[1].net_quantity, 1_000_000); // 平空
     }
 
     // ── 逐仓分账账本(NAV 口径) ─────────────────────────────
@@ -6061,6 +6247,54 @@ mod tests {
         // 开仓只扣手续费（约 5000 × 0.001 = 5），不扣名义
         assert!((cash - 995.0).abs() < 1.0, "cash={cash}");
         assert!(engine.get_position(&inst) > 0.0);
+    }
+
+    /// 全仓开仓按可用保证金缩量：NAV 100 / 1x 只能开约 1 张，不能开 10 张
+    ///
+    /// 修复前全仓分支没有可用保证金校验，NAV 归零后仍能开出巨额仓位，
+    /// 随即被强平并由保险基金兜底，形成僵尸循环。
+    #[test]
+    fn cross_open_is_clamped_by_available_margin() {
+        let mut engine = new_test_engine(100.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 1.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 10.0); // 10 张 = 1000 名义，但 NAV 只有 100
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(
+            engine.get_position(&inst) <= 1.05,
+            "全仓开仓必须按可用保证金缩量,pos={}",
+            engine.get_position(&inst)
+        );
+        assert_eq!(engine.margin_shortfall_count(), 1);
+    }
+
+    /// 穿仓后保险基金兜底 → 冻结；冻结后目标再调大也不会开仓
+    #[test]
+    fn frozen_account_rejects_new_positions_after_insurance_topup() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 100.0); // 名义 1 万，20x → IM 500
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(engine.get_position(&inst) > 0.0);
+        assert!(!engine.is_frozen());
+
+        // 价格跌到 1：浮亏远大于 NAV → 强平 + 保险基金兜底
+        engine.begin_bar(1.0, inst.clone());
+        let events = engine.check_margin();
+        assert!(!events.is_empty(), "应有强平事件");
+        assert!(engine.insurance_fund_loss > 0.0);
+        assert!(engine.is_frozen(), "穿仓兜底后账户必须冻结");
+
+        // 冻结后再要 100 张：引擎必须拒绝开仓
+        engine.set_target_position(inst.clone(), 100.0);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 0);
+        assert!(
+            engine.get_position(&inst).abs() < 1e-9,
+            "冻结后不允许开新仓"
+        );
     }
 
     /// 未启用保证金时保持旧现金流（买入扣全额名义）
