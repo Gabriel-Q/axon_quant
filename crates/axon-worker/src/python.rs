@@ -184,7 +184,7 @@ impl PyBacktestResult {
             d.set_item("instrument", instrument_to_tuple(py, &tr.instrument)?)?;
             // fill 关联：开仓 fill id 列表（同向加仓多条）与触发平仓的 fill id
             d.set_item("entry_fill_ids", tr.entry_fill_ids.clone())?;
-            d.set_item("exit_fill_id", tr.exit_fill_id)?;
+            d.set_item("exit_fill_ids", tr.exit_fill_ids.clone())?;
             list.append(d)?;
         }
         Ok(list)
