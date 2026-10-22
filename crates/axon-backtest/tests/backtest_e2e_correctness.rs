@@ -60,26 +60,6 @@ struct Bar {
     close: f64,
 }
 
-/// 用确定性闭式公式生成 1 个 bar 序列
-///
-/// `i` → `base + step * (i % period < half_period ? 1 : -1)`:
-/// - 前 half_period 根 bar 单调上升
-/// - 后 half_period 根 bar 单调下降
-/// - 形成"先涨后跌"的尖峰
-fn gen_peak_series(n: usize, base: f64, step: f64) -> Vec<Bar> {
-    let half = n / 2;
-    (0..n)
-        .map(|i| Bar {
-            idx: i,
-            close: if i < half {
-                base + step * (i + 1) as f64
-            } else {
-                base + step * (n - i) as f64
-            },
-        })
-        .collect()
-}
-
 /// 用确定性闭式公式生成 1 个单边上涨序列
 fn gen_uptrend(n: usize, base: f64, step: f64) -> Vec<Bar> {
     (0..n)
