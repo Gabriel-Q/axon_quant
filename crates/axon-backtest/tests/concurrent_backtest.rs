@@ -45,6 +45,7 @@ fn base_config() -> BacktestEngineConfig {
         initial_cash: 100_000.0,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     }
 }
 

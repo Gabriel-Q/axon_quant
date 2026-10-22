@@ -38,6 +38,9 @@ pub struct FillRecord {
     pub price: Price,
     /// 成交量
     pub quantity: Quantity,
+    /// fill 全局唯一 id(= fills_detail 下标),回测由 apply_fill 注入
+    #[serde(default)]
+    pub fill_id: u32,
 }
 
 impl FillRecord {
@@ -48,6 +51,9 @@ impl FillRecord {
     /// - `timestamp` / `price` / `quantity`:直接来自 `MatchFill`
     /// - `instrument`:backtest 在 `apply_fill` 时持有的 instrument(0.6.0 起)
     /// - `taker_order_id` / `maker_order_id` / `taker_side`:来自 `MatchFill` 加上 backtest 传入的 taker side
+    /// - `fill_id`:全局唯一 id(= `fills_detail` 下标),回测在 `apply_fill` 时注入
+    // 构造器字段一对一透传,拆成 builder 反而增加调用点噪声
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         timestamp: Timestamp,
         instrument: Instrument,
@@ -56,6 +62,7 @@ impl FillRecord {
         taker_side: Side,
         price: Price,
         quantity: Quantity,
+        fill_id: u32,
     ) -> Self {
         Self {
             timestamp,
@@ -65,6 +72,7 @@ impl FillRecord {
             taker_side,
             price,
             quantity,
+            fill_id,
         }
     }
 
@@ -72,5 +80,29 @@ impl FillRecord {
     #[inline]
     pub fn turnover(&self) -> f64 {
         self.price.as_f64() * self.quantity.as_f64()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{SpotInstrument, Symbol};
+
+    #[test]
+    fn test_fill_record_with_id() {
+        let rec = FillRecord::new(
+            Timestamp::from_nanos(1_000),
+            Instrument::Spot(SpotInstrument {
+                base: Symbol::from("BTC"),
+                quote: Symbol::from("USDT"),
+            }),
+            1,
+            2,
+            Side::Buy,
+            Price::from_f64(100.0),
+            Quantity::from_f64(1.0),
+            7,
+        );
+        assert_eq!(rec.fill_id, 7);
     }
 }

@@ -179,6 +179,7 @@ fn default_config(force_liquidate: bool) -> BacktestEngineConfig {
         initial_cash: 100_000.0,
         fee_config: FeeConfig::default(),
         force_liquidate,
+        margin_specs: std::collections::HashMap::new(),
     }
 }
 

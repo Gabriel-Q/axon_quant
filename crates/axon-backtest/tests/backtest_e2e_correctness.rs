@@ -60,26 +60,6 @@ struct Bar {
     close: f64,
 }
 
-/// 用确定性闭式公式生成 1 个 bar 序列
-///
-/// `i` → `base + step * (i % period < half_period ? 1 : -1)`:
-/// - 前 half_period 根 bar 单调上升
-/// - 后 half_period 根 bar 单调下降
-/// - 形成"先涨后跌"的尖峰
-fn gen_peak_series(n: usize, base: f64, step: f64) -> Vec<Bar> {
-    let half = n / 2;
-    (0..n)
-        .map(|i| Bar {
-            idx: i,
-            close: if i < half {
-                base + step * (i + 1) as f64
-            } else {
-                base + step * (n - i) as f64
-            },
-        })
-        .collect()
-}
-
 /// 用确定性闭式公式生成 1 个单边上涨序列
 fn gen_uptrend(n: usize, base: f64, step: f64) -> Vec<Bar> {
     (0..n)
@@ -210,6 +190,7 @@ fn default_config() -> BacktestEngineConfig {
         initial_cash: 100_000.0,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     }
 }
 
@@ -408,46 +389,86 @@ fn sma_crossover_loses_in_downtrend() {
 
 // ── 测试 3: 震荡行情 → 多次开/平,total_fees > 0 ──────────────────
 
-/// 尖峰(先涨后跌)行情,bar 价格先涨后跌,SMA crossover 在顶点附近触发
-/// buy 然后在下跌中触发 sell,产生完整 round-trip。
+/// 先开多 → 全平 → 再开多 → 再全平,至少 1 次完全平仓 TradeRecord
+///
+/// FLAT_TO_FLAT 改造后,部分平仓不再 push TradeRecord,
+/// 必须等到完全平仓(分支 3)或反手(分支 5)才聚合输出。
+/// 本测试直接用确定性事件序列验证完整 round-trip 链路。
 ///
 /// 期望:
-/// - fills >= 2(至少 1 买 + 1 卖)
-/// - trades.len() >= 1(完全平仓)
+/// - fills >= 4 (2 买 + 2 卖)
+/// - trades.len() >= 2 (两次完全平仓)
 /// - total_fees > 0
 #[test]
 fn sma_crossover_oscillating_market_multiple_trades() {
-    // 20 根 bar:100 → 130 → 100
-    let bars = gen_peak_series(20, 100.0, 1.5);
     let qty = 0.1;
-
-    let mut strat = SmaStrategy::new(2, 5);
-    strat.warmup(&bars[..5]);
-    strat.update_signal();
 
     let mut q = EventQueue::new();
     let mut b = EventBuilder::new(0);
-    for bar in &bars[5..] {
-        strat.closes.push_back(bar.close);
-        if strat.closes.len() > strat.long_win {
-            strat.closes.pop_front();
-        }
-        strat.update_signal();
-        emit_bar(&mut q, &mut b, bar, &mut strat, qty);
-    }
+
+    // 第一轮 round-trip: buy 0.1 @ 100 → sell 0.1 @ 105
+    // 先推 sell 挂簿对手盘(撮合器按 ts 顺序撮合,同一 ts 对手盘先入簿再吃单)
+    let ts1 = Timestamp::from_nanos(1_000_000);
+    q.push(b.order(
+        ts1,
+        1,
+        OrderAction::Submitted(make_limit_order(1, Side::Sell, 100.0, qty)),
+    ));
+    q.push(b.order(
+        ts1,
+        2,
+        OrderAction::Submitted(make_market_order(2, Side::Buy, qty)),
+    ));
+
+    let ts2 = Timestamp::from_nanos(2_000_000);
+    q.push(b.order(
+        ts2,
+        3,
+        OrderAction::Submitted(make_limit_order(3, Side::Buy, 105.0, qty)),
+    ));
+    q.push(b.order(
+        ts2,
+        4,
+        OrderAction::Submitted(make_market_order(4, Side::Sell, qty)),
+    ));
+
+    // 第二轮 round-trip: buy 0.1 @ 110 → sell 0.1 @ 108
+    let ts3 = Timestamp::from_nanos(3_000_000);
+    q.push(b.order(
+        ts3,
+        5,
+        OrderAction::Submitted(make_limit_order(5, Side::Sell, 110.0, qty)),
+    ));
+    q.push(b.order(
+        ts3,
+        6,
+        OrderAction::Submitted(make_market_order(6, Side::Buy, qty)),
+    ));
+
+    let ts4 = Timestamp::from_nanos(4_000_000);
+    q.push(b.order(
+        ts4,
+        7,
+        OrderAction::Submitted(make_limit_order(7, Side::Buy, 108.0, qty)),
+    ));
+    q.push(b.order(
+        ts4,
+        8,
+        OrderAction::Submitted(make_market_order(8, Side::Sell, qty)),
+    ));
 
     let mut engine = BacktestEngine::new(default_config(), q);
     let result = engine.run();
 
     // 震荡应有成交
     assert!(
-        result.fills >= 2,
-        "震荡行情应至少 1 买 + 1 卖,fills={}",
+        result.fills >= 4,
+        "应至少 4 笔 fill(2 买 + 2 卖),fills={}",
         result.fills
     );
     assert!(
-        !result.trades.is_empty(),
-        "至少 1 笔完全平仓 trade,got {}",
+        result.trades.len() >= 2,
+        "应至少 2 笔完全平仓 trade,got {}",
         result.trades.len()
     );
     assert!(
@@ -455,9 +476,6 @@ fn sma_crossover_oscillating_market_multiple_trades() {
         "每笔 fill 都应扣手续费,total_fees={}",
         result.total_fees
     );
-    // 尖峰行情策略至少产生交易,total_pnl 符号不强制
-    // (尖峰 buy 在高点附近、sell 在低点附近 → 反而亏;但只要有 trade 即可)
-    // 这里只断言手续费累加 > 0(已经上面断言)
 }
 
 // ── 测试 4: 完整 PnL 数学验证(确定性,手算) ──────────────────────

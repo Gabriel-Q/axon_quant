@@ -120,6 +120,7 @@ impl PyBacktestEngine {
             // Stage 3 阶段 C(强制平仓):默认关闭,需 Python 端显式调
             // `with_force_liquidate(True)` 启用,避免误触发末日单污染 PnL
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         };
         Ok(Self {
             inner: BacktestEngine::new(config, EventQueue::new()),
@@ -237,6 +238,7 @@ impl PyBacktestEngine {
                 initial_cash: 0.0,
                 fee_config: crate::engine::FeeConfig::default(),
                 force_liquidate: false,
+                margin_specs: std::collections::HashMap::new(),
             },
             EventQueue::new(),
         );
@@ -886,6 +888,9 @@ impl PyRunResult {
             // T0.17 新增:开仓均价(f64)与首次开仓时间(纳秒)
             d.set_item("entry_price", tr.entry_price as f64 / 1e6)?;
             d.set_item("entry_time_ns", tr.entry_time_ns)?;
+            // 开仓 fill id 列表(同向加仓多条)与平仓 fill ids 列表(FLAT_TO_FLAT 聚合),供 Python 侧关联 fills_detail
+            d.set_item("entry_fill_ids", tr.entry_fill_ids.clone())?;
+            d.set_item("exit_fill_ids", tr.exit_fill_ids.clone())?;
             list.append(d)?;
         }
         Ok(list)
@@ -900,7 +905,7 @@ impl PyRunResult {
     /// 适用场景:审计每笔成交、partial fill 分析、按 taker/maker 拆分
     /// 不适用场景:算胜率/夏普(那用 `trades` + `win_rate`/`sharpe_ratio`)
     ///
-    /// 返回 list[dict],每 dict 7 字段:
+    /// 返回 list[dict],每 dict 8 字段:
     /// - `timestamp_ns`:int(fill 时间)
     /// - `instrument`:tuple(`("spot", base, quote)` 或 `("swap", base, quote, settle, contract_size)`)
     /// - `taker_order_id`:int(吃单方)
@@ -908,6 +913,7 @@ impl PyRunResult {
     /// - `taker_side`:str("Buy" / "Sell")
     /// - `price`:float
     /// - `quantity`:float
+    /// - `fill_id`:int(全局唯一,等于本 list 下标;可被 `trades` 的 `entry_fill_ids`/`exit_fill_ids` 引用)
     #[getter]
     fn fills_detail<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
@@ -926,6 +932,7 @@ impl PyRunResult {
             )?;
             d.set_item("price", fr.price.as_f64())?;
             d.set_item("quantity", fr.quantity.as_f64())?;
+            d.set_item("fill_id", fr.fill_id)?;
             list.append(d)?;
         }
         Ok(list)
@@ -968,6 +975,20 @@ impl PyRunResult {
         let list = PyList::empty(py);
         for (ts, nav) in &self.inner.bar_nav_curve {
             let tup = (ts.nanos, *nav);
+            list.append(tup)?;
+        }
+        Ok(list)
+    }
+
+    /// 0.21.0 新增:每 bar 末 balance 存款曲线(`[(timestamp_ns, balance), ...]`)
+    ///
+    /// `balance = cash + Σ(qty × avg_cost)`,与 `bar_nav_curve` 逐帧对齐。
+    /// `bar_nav_curve[i].1 - bar_balance_curve[i].1` 即该帧浮盈（未实现 PnL）。
+    #[getter]
+    fn bar_balance_curve<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for (ts, bal) in &self.inner.bar_balance_curve {
+            let tup = (ts.nanos, *bal);
             list.append(tup)?;
         }
         Ok(list)

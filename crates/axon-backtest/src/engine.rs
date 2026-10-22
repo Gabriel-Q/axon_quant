@@ -18,7 +18,7 @@
 //!   价格调整由 `ImpactedMatchingEngine` 在更高层包装完成
 //! - 单一回测任务单线程执行（事件驱动串行），不引入额外锁
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,9 @@ use axon_core::time::Timestamp;
 use axon_core::types::{Instrument, Price, Quantity, SpotInstrument, Symbol};
 use tracing::trace;
 
+use crate::margin::{
+    LiquidateReason, LiquidationEvent, MarginMode, MarginSnapshot, MarginSpec, MarginTracker,
+};
 use crate::matching::MatchingEngine;
 use crate::streaming::l3_diff::{L3BookDiff, L3BookSubscriber, SubscriberKind};
 
@@ -65,6 +68,12 @@ pub struct BacktestEngineConfig {
     pub fee_config: FeeConfig,
     /// EOD 强制平仓开关(默认 false,见 BacktestEngineConfig doc)
     pub force_liquidate: bool,
+    /// 每品种保证金规格(key = `"BTC/USDT"`;空 = 未启用保证金 = 零行为变化)
+    ///
+    /// 非空时引擎构造 `MarginTracker`,并在编排层 bar 末调用 `check_margin`。
+    /// key 用字符串而非 `Instrument`:配置链路(Python dict / JSON)本来就是
+    /// 字符串,避免在每层反复做 instrument 编解码。
+    pub margin_specs: HashMap<String, MarginSpec>,
 }
 
 /// 手续费配置(Stage 3 阶段 B 新增)
@@ -97,6 +106,7 @@ impl std::fmt::Debug for BacktestEngineConfig {
             .field("initial_cash", &self.initial_cash)
             .field("fee_config", &self.fee_config)
             .field("force_liquidate", &self.force_liquidate)
+            .field("margin_specs", &self.margin_specs)
             .finish()
     }
 }
@@ -161,6 +171,22 @@ impl RiskMetricsReport {
             sharpe_with_legs: sharpe_ratio,
         }
     }
+}
+
+/// 单品种「实际生效」的保证金规格（结果回显用）
+///
+/// 与 `margin_specs` 入参的区别：值来自引擎真正构造的 [`MarginTracker`]，
+/// 前端据此核对杠杆 / 模式 / 档位来源是否按预期生效，而不是回显提交值。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EffectiveMarginSpec {
+    /// 品种 key（"BASE/QUOTE"）
+    pub symbol: String,
+    /// 实际生效杠杆
+    pub leverage: f64,
+    /// `"isolated"` / `"cross"`
+    pub margin_mode: String,
+    /// 档位来源：`db` / `snapshot` / `default`
+    pub bracket_source: String,
 }
 
 /// 回测运行结果
@@ -269,6 +295,14 @@ pub struct RunResult {
     /// win rate 等"按 bar 频率"的指标,避免短回测 + 无 fill 时 `equity_curve`
     /// 末帧 = initial_cash 失真。
     pub bar_nav_curve: Vec<(Timestamp, f64)>,
+    /// 0.21.0 新增:每 bar 末 balance 曲线(`(timestamp_ns, balance)`),与 `bar_nav_curve` 逐帧对齐
+    ///
+    /// balance(MT4 口径)= `cash + Σ(quantity × avg_cost)`:
+    /// 开仓/持仓期间不随 mark 波动,只在平仓(已实现盈亏)、手续费、资金费结算时变化。
+    ///
+    /// 与 `bar_nav_curve` 的关系:`nav - balance` 即当前浮盈(未实现 PnL)。
+    /// 调用方把 balance 画成「存款」曲线,净值高于它即浮盈、低于即浮亏。
+    pub bar_balance_curve: Vec<(Timestamp, f64)>,
     /// NAV 历史峰值(用于计算 max_drawdown_pct)
     pub nav_peak: f64,
     /// 最大回撤百分比(`max_drawdown / nav_peak`,0~1)
@@ -305,6 +339,22 @@ pub struct RunResult {
     /// `positions` + `sharpe_ratio` 派生,通过 PyO3 binding 暴露到
     /// `run_result["risk_metrics"]` dict。
     pub risk_metrics: RiskMetricsReport,
+
+    // ── 保证金 / 强平(0.21.0) ─────────────────────────────
+    /// 强平事件时间线(未启用保证金时为空)
+    pub liquidation_events: Vec<LiquidationEvent>,
+    /// 穿仓兜底累计额(保险基金语义,未启用保证金时恒为 0)
+    pub insurance_fund_loss: f64,
+    /// 判定价口径(v1 固定 `"close"`:bar 级近似,无独立 mark 序列)
+    pub price_basis: String,
+    /// 是否启用保证金账务（`margin_specs` 非空即启用）
+    pub margin_applied: bool,
+    /// 实际生效的每品种规格（含档位来源），用于前端核对
+    pub margin_specs_effective: Vec<EffectiveMarginSpec>,
+    /// 强平事件条数（= `liquidation_events.len()`）
+    pub liquidation_count: u32,
+    /// 因可用自由余额不足而被缩量的开仓次数
+    pub margin_shortfall_count: u32,
 }
 
 impl Default for RunResult {
@@ -328,6 +378,8 @@ impl Default for RunResult {
             equity_curve: Vec::new(),
             // 0.7.1 新增:每 bar 末 NAV 曲线
             bar_nav_curve: Vec::new(),
+            // 0.21.0 新增:每 bar 末 balance 曲线
+            bar_balance_curve: Vec::new(),
             nav_peak: 0.0,
             max_drawdown_pct: 0.0,
             win_rate: 0.0,
@@ -342,6 +394,14 @@ impl Default for RunResult {
             rebalances_triggered: 0,
             // 0.7.0 新增(Phase 4)
             risk_metrics: RiskMetricsReport::default(),
+            // 0.21.0 新增:保证金 / 强平
+            liquidation_events: Vec::new(),
+            insurance_fund_loss: 0.0,
+            price_basis: "close".to_string(),
+            margin_applied: false,
+            margin_specs_effective: Vec::new(),
+            liquidation_count: 0,
+            margin_shortfall_count: 0,
         }
     }
 }
@@ -394,6 +454,13 @@ struct PositionState {
     realized_pnl: f64,
     /// 累计开仓手续费
     entry_fee: f64,
+    /// 当前持仓由哪些开仓 fill 构成（状态1起头、状态2追加、平仓时读后清空）
+    open_fill_ids: Vec<u32>,
+    // ── FLAT_TO_FLAT: 跨 partial close 累积平仓状态 ──
+    pending_close_fills: Vec<u32>,
+    cumulative_close_qty: f64,
+    cumulative_close_commission: f64,
+    cumulative_close_pnl: f64,
 }
 
 /// 回测运行时状态(Stage 3 阶段 B 新增,封装在 `BacktestEngine` 内部)
@@ -464,6 +531,24 @@ struct BacktestState {
     /// 时间戳为 `begin_bar` 收尾时的 `clock.now()`(bar 末 funding 调度后)。
     /// 若 `mark_cache` 为空,NAV = cash(无未实现 PnL)。
     bar_nav_curve: Vec<(Timestamp, f64)>,
+    /// 0.21.0 新增:每 bar 末 balance 曲线(`(Timestamp, balance)`)
+    ///
+    /// balance(MT4 口径)= `cash + Σ(quantity × avg_cost)`:
+    /// 开仓/持仓期间不随 mark 波动,只在平仓(已实现盈亏)、手续费、资金费结算时变化。
+    ///
+    /// 与 `bar_nav_curve` 的关系:`nav - balance = Σ quantity × (mark - avg_cost)` = 浮盈。
+    /// 前端/报告把 balance 画成「存款」曲线,净值高于它即浮盈、低于即浮亏。
+    ///
+    /// 与 `bar_nav_curve` 由同一次 `sample_bar_nav` 调用采样,两者长度恒等。
+    bar_balance_curve: Vec<(Timestamp, f64)>,
+    /// 逐仓子账户保证金余额(`cross` / 未启用保证金时为空)
+    ///
+    /// 划转只在 `cash ↔ isolated` 之间搬运,对 NAV 中性;强平减仓后按剩余名义
+    /// 释放多余保证金,避免下一 bar 再次判定爆仓(连锁误强平)。
+    ///
+    /// 空账本时 `compute_nav` / `compute_balance` 的 `Σ isolated` 为 0.0,
+    /// 与旧公式逐位一致(浮点加 0.0 是精确操作)。
+    isolated: HashMap<Instrument, f64>,
 }
 
 /// Leg 配置(策略目标仓位)
@@ -600,6 +685,26 @@ pub struct BacktestEngine {
     subscribers: HashMap<u64, (Box<dyn L3BookSubscriber>, SubscriberKind)>,
     /// 0.9.0 C2.1 新增:订阅者 ID 自增
     next_subscriber_id: u64,
+    /// 保证金追踪器(`None` = 未启用保证金,零行为变化)
+    margin: Option<MarginTracker>,
+    /// 累计穿仓兜底额(保险基金语义)
+    insurance_fund_loss: f64,
+    /// 账户是否已穿仓冻结:一旦保险基金把 NAV 从负值抬回 0 就置位,
+    /// 此后禁止再开新仓/加仓(只允许减仓),避免"零权益反复开仓→强平→兜底"的死循环
+    frozen: bool,
+    /// 强平事件时间线(每 bar 检查产出的事件累积到这里)
+    liquidation_events: Vec<LiquidationEvent>,
+    /// 因可用保证金不足而被缩量的开仓次数
+    ///
+    /// 只统计"想开但开不起"的次数,用于结果回显（前端提示"部分开仓受
+    /// 可用保证金限制"）；不影响已成交部分的口径。逐仓看自由现金，
+    /// 全仓看 NAV − 已占用初始保证金。
+    margin_shortfall_count: u32,
+    /// 上一次 `check_margin` 中被强平的品种（"BASE/QUOTE"）
+    ///
+    /// `check_margin` 每次开头清空,只保留"最近一次检查"的结果；worker 在
+    /// 下一根 bar 用它阻止 Hold 决策把刚被清掉的仓位原样开回来。
+    liquidated_last_bar: HashSet<String>,
 }
 
 impl std::fmt::Debug for BacktestEngine {
@@ -661,6 +766,12 @@ impl BacktestEngine {
     /// - `event_queue`：已填充事件的事件队列（所有权转移）
     pub fn new(config: BacktestEngineConfig, event_queue: EventQueue) -> Self {
         let initial_cash = config.initial_cash;
+        // 保证金:空 specs = 未启用(不构造 tracker,check_margin 是 no-op)
+        let margin = if config.margin_specs.is_empty() {
+            None
+        } else {
+            Some(MarginTracker::new(config.margin_specs.clone()))
+        };
         // 初始 NAV = initial_cash,记入 peak
         let bt_state = BacktestState {
             cash: initial_cash,
@@ -699,6 +810,13 @@ impl BacktestEngine {
             // 0.9.0 C2.1 新增:订阅者注册表默认空,id 从 0 开始
             subscribers: HashMap::new(),
             next_subscriber_id: 0,
+            // 保证金默认未启用:tracker 为 None,check_margin 直接返回空
+            margin,
+            insurance_fund_loss: 0.0,
+            frozen: false,
+            liquidation_events: Vec::new(),
+            margin_shortfall_count: 0,
+            liquidated_last_bar: HashSet::new(),
         }
     }
 
@@ -996,16 +1114,38 @@ impl BacktestEngine {
     fn sample_bar_nav(&mut self, mark_fallback: f64) {
         let ts = self.config.clock.now();
         let nav = self.compute_nav(ts, mark_fallback);
-        if let Some(last) = self.bt_state.bar_nav_curve.last_mut()
-            && last.0 == ts
+        // 0.21.0:balance 与 nav 在同一次调用内采样,保证两条曲线逐帧对齐
+        let balance = self.compute_balance();
+
+        // NAV 侧:同 bar 二次采样时覆盖末帧,避免重复点污染 Sharpe / max_drawdown
+        if self
+            .bt_state
+            .bar_nav_curve
+            .last()
+            .is_some_and(|last| last.0 == ts)
         {
-            last.1 = nav;
-            // 0.8.0 B5:NAV 累加器也维护(覆盖 case 也要重记,确保 calmar 与 bar 末对齐)
-            self.bt_state.trading_metrics.record_nav(nav);
-            return;
+            if let Some(last) = self.bt_state.bar_nav_curve.last_mut() {
+                last.1 = nav;
+            }
+        } else {
+            self.bt_state.bar_nav_curve.push((ts, nav));
         }
-        self.bt_state.bar_nav_curve.push((ts, nav));
-        // 0.8.0 B5:NAV 累加器维护(供 calmar_ratio 用)
+
+        // balance 侧:与 NAV 同规则(同戳覆盖),长度恒等于 bar_nav_curve
+        if self
+            .bt_state
+            .bar_balance_curve
+            .last()
+            .is_some_and(|last| last.0 == ts)
+        {
+            if let Some(last) = self.bt_state.bar_balance_curve.last_mut() {
+                last.1 = balance;
+            }
+        } else {
+            self.bt_state.bar_balance_curve.push((ts, balance));
+        }
+
+        // 0.8.0 B5:NAV 累加器维护(覆盖 case 也要重记,确保 calmar 与 bar 末对齐)
         self.bt_state.trading_metrics.record_nav(nav);
     }
 
@@ -1151,6 +1291,62 @@ impl BacktestEngine {
             .position_states
             .get(instrument)
             .map(|p| p.quantity)
+            .unwrap_or(0.0)
+    }
+
+    /// 逐仓:从主账户划入子账户保证金(NAV 中性)
+    ///
+    /// 只搬运 `cash → isolated`,不动持仓与已实现盈亏,所以划转前后 NAV 不变。
+    /// 调用方(编排层)负责按 `名义 / leverage` 决定划入多少。
+    pub fn deposit_isolated(&mut self, instrument: &Instrument, margin: f64) {
+        // 保证金模式下自由余额不足时只划可用部分：cash 不允许被保证金划转扣成负数。
+        // 缺口由 `rebalance_to_target` 的开仓缩量负责，这里只是最后一道保险。
+        // 非保证金品种（含 spot）沿用旧语义，不做夹取，保持与历史结果逐位一致。
+        let margin = if self.is_margined(instrument) {
+            margin.min(self.bt_state.cash.max(0.0))
+        } else {
+            margin
+        };
+        if margin <= 0.0 {
+            return;
+        }
+        self.bt_state.cash -= margin;
+        *self
+            .bt_state
+            .isolated
+            .entry(instrument.clone())
+            .or_insert(0.0) += margin;
+    }
+
+    /// 逐仓:子账户多余保证金释放回主账户(NAV 中性)
+    ///
+    /// `amount` 会被夹到当前余额,不会把子账户扣成负数;余额清零时移除条目。
+    pub fn release_isolated(&mut self, instrument: &Instrument, amount: f64) {
+        let cur = self
+            .bt_state
+            .isolated
+            .get(instrument)
+            .copied()
+            .unwrap_or(0.0);
+        let release = amount.clamp(0.0, cur);
+        if release <= 0.0 {
+            return;
+        }
+        self.bt_state.cash += release;
+        let left = cur - release;
+        if left <= 1e-12 {
+            self.bt_state.isolated.remove(instrument);
+        } else {
+            self.bt_state.isolated.insert(instrument.clone(), left);
+        }
+    }
+
+    /// 逐仓子账户余额(不存在时 0)
+    pub fn isolated_balance(&self, instrument: &Instrument) -> f64 {
+        self.bt_state
+            .isolated
+            .get(instrument)
+            .copied()
             .unwrap_or(0.0)
     }
 
@@ -1386,6 +1582,33 @@ impl BacktestEngine {
         side: Side,
         fill: &crate::matching::MatchFill,
     ) {
+        // 先取值再可变借用:否则 `self.config` 与 `&mut self` 同时借用冲突
+        let rate = self.config.fee_config.taker_rate;
+        self.apply_fill_with_fee(instrument, side, fill, rate);
+    }
+
+    /// 该 instrument 是否走保证金账务（spec 存在且为永续）
+    ///
+    /// 只有期货(swap)才可能带保证金：spot 即便同名 key 出现在 specs 里也不改
+    /// 现金流口径，保证现货路径与旧实现逐位一致。
+    fn is_margined(&self, instrument: &Instrument) -> bool {
+        let Some(tracker) = self.margin.as_ref() else {
+            return false;
+        };
+        matches!(instrument, Instrument::Swap(_))
+            && tracker.specs().contains_key(&instrument_key(instrument))
+    }
+
+    /// 按指定费率处理单笔 fill(供强平路径使用:强平费 ≠ taker 费率)
+    ///
+    /// 函数体与原 `apply_fill` 完全一致,只有手续费率由调用方给定。
+    fn apply_fill_with_fee(
+        &mut self,
+        instrument: &Instrument,
+        side: Side,
+        fill: &crate::matching::MatchFill,
+        fee_rate: f64,
+    ) {
         let fill_price = fill.price.as_f64();
         let fill_qty = fill.quantity.as_f64();
         // 成交/持仓/NAV 的审计时间统一用模拟时钟（= 当前 bar 的事件时间）。
@@ -1395,11 +1618,20 @@ impl BacktestEngine {
 
         // ── 1. 现金 + 手续费 ────────────────────────────
         let notional = fill_price * fill_qty;
-        let fee = notional * self.config.fee_config.taker_rate;
+        let fee = notional * fee_rate;
         self.bt_state.fee_accumulator += fee;
-        match side {
-            Side::Buy => self.bt_state.cash -= notional + fee,
-            Side::Sell => self.bt_state.cash += notional - fee,
+        if self.is_margined(instrument) {
+            // 保证金模式不搬名义：持仓的合约价值由保证金/权益口径承担，不占自由余额。
+            // 开仓/加仓这里只扣手续费；平仓的已实现盈亏在下方 6 状态机算完后
+            // 统一按 Δrealized_pnl 记回 cash（开仓时为 0，不影响）。
+            // ponytail: 不做逐笔保证金划转，逐仓划转由 `sync_isolated_margins`
+            // 统一处理；上限是同一 bar 内多次加仓只在 bar 末核定一次。
+            self.bt_state.cash -= fee;
+        } else {
+            match side {
+                Side::Buy => self.bt_state.cash -= notional + fee,
+                Side::Sell => self.bt_state.cash += notional - fee,
+            }
         }
 
         // ── 1.5. 0.7.0 新增:记录每笔 fill 到 `fills_detail` ─────────────
@@ -1410,6 +1642,8 @@ impl BacktestEngine {
         // - `MatchFill.timestamp` 是 Order 创建时的 `taker_created`(wall clock)
         // - 用户的 `Event::OrderSubmitted.timestamp_ns` 是 simulated event time
         // - backtest 报表/审计需要的"事件时间"是后者(`self.config.clock`)
+        // fill_id 取 push 前下标，保证全局唯一且等于 fills_detail 下标
+        let fill_id = self.bt_state.fills_detail.len() as u32;
         self.bt_state.fills_detail.push(FillRecord::new(
             self.config.clock.now(),
             instrument.clone(),
@@ -1418,6 +1652,7 @@ impl BacktestEngine {
             side,
             fill.price,
             fill.quantity,
+            fill_id,
         ));
 
         // ── 2. 6 状态机 ──────────────────────────────
@@ -1428,6 +1663,14 @@ impl BacktestEngine {
         };
         // T3.5 改:`position_states.entry(instrument.clone())` 直接以
         // `&Instrument` 作 key,无需 `instrument_to_key` 派生字符串。
+        // 先记录已实现盈亏基线：保证金模式下本笔 fill 结束后只把"本次实现的
+        // 盈亏"记回 cash，不能把历史累计值重复入账。
+        let realized_before = self
+            .bt_state
+            .position_states
+            .get(instrument)
+            .map(|p| p.realized_pnl)
+            .unwrap_or(0.0);
         let pos = self
             .bt_state
             .position_states
@@ -1445,6 +1688,11 @@ impl BacktestEngine {
                 pos.entry_fee = fee;
                 pos.entry_time_ns = timestamp.nanos;
                 pos.side = Some(side);
+                pos.open_fill_ids = vec![fill_id];
+                pos.pending_close_fills.clear();
+                pos.cumulative_close_qty = 0.0;
+                pos.cumulative_close_commission = 0.0;
+                pos.cumulative_close_pnl = 0.0;
             }
             // (2) 同向加仓 (sign same, p≠0)
             (p, n) if p.signum() == n.signum() && p != 0.0 => {
@@ -1453,18 +1701,30 @@ impl BacktestEngine {
                 pos.avg_cost = (p.abs() * pos.avg_cost + n.abs() * fill_price) / new_qty.abs();
                 pos.quantity = new_qty;
                 pos.entry_fee += fee;
+                pos.open_fill_ids.push(fill_id);
             }
             // (3) 完全平仓 (sign diff, |p|=|n|,容忍 1e-9 浮点误差)
             (p, n) if p.signum() != n.signum() && (p + n).abs() < 1e-9 => {
+                // 读后清空：这批开仓 fill 归属本笔平仓 trade
+                let entry_fill_ids = std::mem::take(&mut pos.open_fill_ids);
                 let close_qty = p.abs();
-                let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
-                pos.realized_pnl += pnl;
+                let this_pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
+                pos.realized_pnl += this_pnl;
                 self.bt_state
                     .trading_metrics
-                    .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                    .record_trade((this_pnl * 1e6) as i64, (fee * 1e6) as i64);
                 // 开仓均价/时间必须在清仓前读取(avg_cost 会被置 0)
                 let entry_price = (pos.avg_cost * 1e6) as i64;
                 let entry_time_ns = pos.entry_time_ns;
+                // FLAT_TO_FLAT:聚合跨 partial close 的平仓 fill ids 与累计指标
+                let exit_fill_ids = {
+                    let mut v = std::mem::take(&mut pos.pending_close_fills);
+                    v.push(fill_id);
+                    v
+                };
+                let total_close_qty = pos.cumulative_close_qty + close_qty;
+                let total_pnl = pos.cumulative_close_pnl + this_pnl;
+                let total_fee = pos.cumulative_close_commission + fee;
                 let trade = Trade::new(
                     timestamp,
                     fill.price,
@@ -1474,12 +1734,14 @@ impl BacktestEngine {
                 );
                 self.bt_state.trades.push(TradeRecord::new(
                     trade,
-                    (pnl * 1e6) as i64,
-                    (fee * 1e6) as i64,
-                    (n * 1e6) as i64,
+                    (total_pnl * 1e6) as i64,
+                    (total_fee * 1e6) as i64,
+                    (total_close_qty * n.signum() * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
+                    entry_fill_ids,
+                    exit_fill_ids,
                 ));
                 // 清仓
                 pos.quantity = 0.0;
@@ -1487,54 +1749,57 @@ impl BacktestEngine {
                 pos.entry_price = 0.0;
                 pos.entry_fee = 0.0;
                 pos.side = None;
+                pos.cumulative_close_qty = 0.0;
+                pos.cumulative_close_commission = 0.0;
+                pos.cumulative_close_pnl = 0.0;
             }
             // (4) 反向部分平仓 (sign diff, |n| < |p|):用 |n| 平掉一部分旧仓,留 p+n
+            //
+            // FLAT_TO_FLAT:不再每部分平仓都 push TradeRecord。
+            // 改为只把 fill_id 追加到 pending_close_fills、累计 close_qty/pnl/fee,
+            // 等分支 (3) 完全平仓或分支 (5) 反手时一次性聚合成一条 TradeRecord。
             //
             // ponytail:修复 #R-04 — 之前 `close_qty = p.abs()` 错误地把旧仓全平,
             // 跟"完全平仓"分支语义重叠;正确语义是"反向 fill 一部分只平一部分"。
             // 终态 `pos.quantity = p + n`,方向同 n,幅值 = |p| - |n|。
             (p, n) if p.signum() != n.signum() && n.abs() < p.abs() => {
                 let close_qty = n.abs();
-                let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
-                pos.realized_pnl += pnl;
+                let this_pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
+                pos.realized_pnl += this_pnl;
                 self.bt_state
                     .trading_metrics
-                    .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
-                // 部分平仓:开仓均价/时间取自当前持仓(avg_cost 未被清)
-                let entry_price = (pos.avg_cost * 1e6) as i64;
-                let entry_time_ns = pos.entry_time_ns;
-                // 平仓的 TradeRecord(净量 = n,即本次 fill 方向)
-                let close_trade = Trade::new(
-                    timestamp,
-                    fill.price,
-                    Quantity::from_f64(close_qty),
-                    fill.maker_order_id,
-                    fill.taker_order_id,
-                );
-                self.bt_state.trades.push(TradeRecord::new(
-                    close_trade,
-                    (pnl * 1e6) as i64,
-                    (fee * 1e6) as i64,
-                    (n * 1e6) as i64,
-                    instrument.clone(), // T2.4 新增
-                    entry_price,
-                    entry_time_ns,
-                ));
+                    .record_trade((this_pnl * 1e6) as i64, (fee * 1e6) as i64);
+                // FLAT_TO_FLAT:不 push TradeRecord,只累积
+                pos.pending_close_fills.push(fill_id);
+                pos.cumulative_close_qty += close_qty;
+                pos.cumulative_close_pnl += this_pnl;
+                pos.cumulative_close_commission += fee;
                 // 留 p+n(同 n 方向,幅值 = |p|-|n|)
                 pos.quantity = p + n;
                 // 平均成本不变(没加新仓,只是减仓)
             }
             // (5) 反手 (sign diff, |n| > |p|):平 p + 开反向 (n+p)
             (p, n) if p.signum() != n.signum() && n.abs() > p.abs() => {
+                // 旧仓的开仓 fill 归属本笔旧 trade；本次 fill 同时充当新仓开仓 fill
+                let old_fill_ids = std::mem::take(&mut pos.open_fill_ids);
                 let close_qty = p.abs();
-                let pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
-                pos.realized_pnl += pnl;
+                let this_pnl = (fill_price - pos.avg_cost) * close_qty * p.signum();
+                pos.realized_pnl += this_pnl;
                 self.bt_state
                     .trading_metrics
-                    .record_trade((pnl * 1e6) as i64, (fee * 1e6) as i64);
+                    .record_trade((this_pnl * 1e6) as i64, (fee * 1e6) as i64);
                 // 反手:平掉旧仓的开仓均价/时间取自旧持仓(反手后会被新仓覆盖)
                 let entry_price = (pos.avg_cost * 1e6) as i64;
                 let entry_time_ns = pos.entry_time_ns;
+                // FLAT_TO_FLAT:旧仓 exit_fill_ids = pending_close_fills + 反手 fill_id
+                let exit_fill_ids = {
+                    let mut v = std::mem::take(&mut pos.pending_close_fills);
+                    v.push(fill_id);
+                    v
+                };
+                let total_close_qty = pos.cumulative_close_qty + close_qty;
+                let total_pnl = pos.cumulative_close_pnl + this_pnl;
+                let total_fee = pos.cumulative_close_commission + fee;
                 let close_trade = Trade::new(
                     timestamp,
                     fill.price,
@@ -1542,14 +1807,17 @@ impl BacktestEngine {
                     fill.maker_order_id,
                     fill.taker_order_id,
                 );
+                // 旧仓 net_quantity = -total_close_qty * p.signum()
                 self.bt_state.trades.push(TradeRecord::new(
                     close_trade,
-                    (pnl * 1e6) as i64,
-                    (fee * 1e6) as i64,
-                    (-p * 1e6) as i64,
+                    (total_pnl * 1e6) as i64,
+                    (total_fee * 1e6) as i64,
+                    (-total_close_qty * p.signum() * 1e6) as i64,
                     instrument.clone(), // T2.4 新增
                     entry_price,
                     entry_time_ns,
+                    old_fill_ids,
+                    exit_fill_ids,
                 ));
                 // 开反向 n + p
                 pos.quantity = n + p;
@@ -1558,9 +1826,26 @@ impl BacktestEngine {
                 pos.entry_fee = fee;
                 pos.entry_time_ns = timestamp.nanos;
                 pos.side = Some(side);
+                pos.open_fill_ids = vec![fill_id];
+                pos.pending_close_fills.clear();
+                pos.cumulative_close_qty = 0.0;
+                pos.cumulative_close_commission = 0.0;
+                pos.cumulative_close_pnl = 0.0;
             }
             // 不应到达 — 防御性兜底
             _ => {}
+        }
+
+        if self.is_margined(instrument) {
+            let realized_after = self
+                .bt_state
+                .position_states
+                .get(instrument)
+                .map(|p| p.realized_pnl)
+                .unwrap_or(0.0);
+            // 平仓/反手时把本次实现的盈亏记回自由余额（开仓/加仓时为 0）。
+            // 逐仓的保证金占用/释放不在这里处理，由 `sync_isolated_margins` 负责。
+            self.bt_state.cash += realized_after - realized_before;
         }
 
         // ── 3. NAV 采样 + log return ─────────────────
@@ -1651,13 +1936,19 @@ impl BacktestEngine {
 
     /// Phase B 新增(0.5.0):按 instrument 各自的 `mark_cache` 价计算 mark-to-market NAV
     ///
-    /// 公式:`NAV = cash + Σ(quantity[instrument] × mark[instrument])`
+    /// 公式:`NAV = cash + Σ isolated + Σ(quantity[instrument] × mark[instrument])`
+    /// - 逐仓子账户余额是账户资产的一部分(划转只在 cash ↔ isolated 间搬运)
+    /// - 空账本时 `Σ isolated = 0.0`,与旧公式逐位一致
     /// - `mark_cache[instrument]` 若有,用缓存的 mark 价
     /// - 若无,**fallback_mark** 给定(通常是本次 fill_price,旧场景无 mark 数据)
     /// - 既无 mark 也无 fallback 的 instrument 用其 `avg_cost` 占位(避免
     ///   没 mark 时 NAV 看起来是 0,误导回测)
     fn compute_nav(&self, _timestamp: Timestamp, fallback_mark: f64) -> f64 {
-        let position_value: f64 = self
+        // 分段估值：
+        // - 保证金品种只计浮盈亏（名义由保证金账本承担，不再占 cash）
+        // - 其余品种保持旧式 `qty × mark` 市值估值
+        // specs 为空时 margined 恒为 0，整条公式退化为旧实现（逐位一致）。
+        let (margined_value, legacy_value): (f64, f64) = self
             .bt_state
             .position_states
             .iter()
@@ -1672,10 +1963,50 @@ impl BacktestEngine {
                     // 多品种共享账户下后者会把 A 品种持仓用 B 品种价格估值,NAV/PnL 失真。
                     .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
                     .unwrap_or(fallback_mark);
-                pos.quantity * mark
+                if self.is_margined(inst) {
+                    (pos.quantity * (mark - pos.avg_cost), 0.0)
+                } else {
+                    (0.0, pos.quantity * mark)
+                }
+            })
+            .fold((0.0, 0.0), |acc, x| (acc.0 + x.0, acc.1 + x.1));
+        let isolated_total: f64 = self.bt_state.isolated.values().sum();
+        self.bt_state.cash + isolated_total + margined_value + legacy_value
+    }
+
+    /// 0.21.0 新增:按持仓成本口径计算 balance(MT4 语义)
+    ///
+    /// 公式:`balance = NAV − Σ(quantity × (mark − avg_cost))`
+    ///
+    /// 与 `compute_nav` 的区别:持仓用 **avg_cost**(开仓成本价)而非 mark 估值。
+    /// 因此开仓瞬间 balance 只减少手续费,持仓期间不随价格波动,平仓时按已实现盈亏变化。
+    /// 恒等式:`nav - balance == 未实现 PnL(浮盈)`。
+    ///
+    /// 等价于旧式 `cash + Σ isolated + Σ(quantity × avg_cost)`：非保证金品种
+    /// 的市值项与浮盈亏项相抵，保证金品种的浮盈亏也只算一次。
+    ///
+    /// 这里同样加回 `Σ isolated`:否则逐仓划转会让 balance 凭空少一截,
+    /// `nav - balance` 的恒等式立刻被破坏。空账本时结果与旧公式逐位一致。
+    fn compute_balance(&self) -> f64 {
+        // balance = NAV − 浮盈亏（两种账务模式等价）：
+        // 保证金模式下 NAV 只含浮盈亏，减掉后回到"已实现口径"；
+        // 非保证金模式下 NAV = cash + Σ qty×mark，减掉浮盈亏即 Σ qty×avg_cost。
+        let unrealized: f64 = self
+            .bt_state
+            .position_states
+            .iter()
+            .map(|(inst, pos)| {
+                let mark = self
+                    .bt_state
+                    .mark_cache
+                    .get(inst)
+                    .map(|m| m.as_f64())
+                    .or_else(|| self.bt_state.bar_mid_by_instrument.get(inst).copied())
+                    .unwrap_or(pos.avg_cost);
+                pos.quantity * (mark - pos.avg_cost)
             })
             .sum();
-        self.bt_state.cash + position_value
+        self.compute_nav(self.config.clock.now(), 0.0) - unrealized
     }
 
     /// 0.5.0 新增(Phase C):处理 Funding 结算事件
@@ -1823,6 +2154,292 @@ impl BacktestEngine {
         self
     }
 
+    /// 风险减仓:只允许向 0 缩减,永不反手;**绕过** bar_id guard。
+    ///
+    /// 用途:保证金强平。与 `rebalance_to_target` 的区别:
+    /// - 不做阈值判断、不累加 `rebalances_triggered`、不写 `last_rebalance_bar_id`
+    /// - `target_qty` 夹在 `[0, current]`(多仓)或 `[current, 0]`(空仓)
+    /// - 手续费率由调用方给定(强平费 ≠ taker 费率)
+    ///
+    /// 为什么必须绕过 guard:`begin_bar_multi` 在 bar 末已自动调过一次
+    /// `rebalance_to_target`,本 bar 内再调一律 no-op;而强平发生在同一 bar
+    /// 的 funding 之后,若走 rebalance 路径会被 guard 吃掉,导致只判定不执行。
+    ///
+    /// # 返回
+    ///
+    /// 实际产生的 fill 数(0 = 无需减仓或未成交)。
+    pub fn risk_reduce(&mut self, instrument: &Instrument, target_qty: f64, fee_rate: f64) -> u64 {
+        let current = self
+            .bt_state
+            .position_states
+            .get(instrument)
+            .map(|p| p.quantity)
+            .unwrap_or(0.0);
+        if current.abs() < 1e-12 {
+            return 0;
+        }
+        // 只减不增:多仓目标夹到 [0, current],空仓夹到 [current, 0]。
+        // 夹紧而不是拒绝,是因为 tracker 给的是"减到哪个数量",数值可能因
+        // 档位换算略超/略欠;夹紧保证永不反手、永不增仓。
+        let target = if current > 0.0 {
+            target_qty.clamp(0.0, current)
+        } else {
+            target_qty.clamp(current, 0.0)
+        };
+        let delta = target - current;
+        if delta.abs() < 1e-12 {
+            return 0;
+        }
+        let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
+        let order_id = self
+            .rebalance_next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let order = crate::matching::l3::engine_l3::build_leg_order(
+            order_id,
+            instrument,
+            side,
+            OrderType::Market,
+            Quantity::from_f64(delta.abs()),
+            TimeInForce::IOC,
+        );
+        let result = self.config.matching_engine.submit(order);
+        let mut filled = 0u64;
+        for fill in &result.fills {
+            self.stats.orders_accepted += 1;
+            self.stats.fills += 1;
+            self.stats.total_pnl += fill_pnl_delta(fill);
+            self.apply_fill_with_fee(instrument, side, fill, fee_rate);
+            filled += 1;
+        }
+        filled
+    }
+
+    /// 逐仓保证金核定:按当前判定价把各逐仓品种的子账户余额补足/释放到位。
+    ///
+    /// 调用时机:
+    /// - `rebalance_to_target` 结束处:开仓/调仓当 bar 就完成划转,不等下一次检查
+    /// - `check_margin` 开头:先按最新 bar 价核定,再做强平判定
+    ///
+    /// 不核定会怎样:逐仓子账户恒为 0,`equity = 0 + 浮盈亏`,只要持仓有微小浮亏
+    /// 就会被判爆仓 —— 逐仓模式实际不可用。
+    ///
+    /// ponytail:按 bar 末价格核定保证金,不做 bar 内逐笔划转;升级路径是把核定
+    /// 挂到 fill 事件上(开/加/减仓即时划转)。
+    pub fn sync_isolated_margins(&mut self) {
+        if self.margin.is_none() {
+            return;
+        }
+        // 先收集目标(不可变借用),再统一划转(可变借用),避免借用冲突
+        let mut targets: Vec<(Instrument, f64, String)> = Vec::new();
+        if let Some(tracker) = self.margin.as_ref() {
+            for (inst, pos) in &self.bt_state.position_states {
+                let sym = instrument_key(inst);
+                if tracker.mode_of(&sym) != MarginMode::Isolated {
+                    continue;
+                }
+                let price = self.judged_price(inst, pos.avg_cost);
+                // 清仓后 quantity=0 → required=0 → 全额释放剩余保证金
+                let required = tracker.required_isolated(&sym, pos.quantity.abs() * price);
+                targets.push((inst.clone(), required, sym));
+            }
+        }
+        for (inst, required, sym) in targets {
+            let held = self.isolated_balance(&inst);
+            if required > held {
+                self.deposit_isolated(&inst, required - held);
+            } else if held > required {
+                self.release_isolated(&inst, held - required);
+            }
+            // 两边账本必须一致:tracker 负责判定,引擎账本负责 NAV。
+            // 以引擎实际余额为准：deposit 可能在现金不足时被夹小。
+            let actual = self.isolated_balance(&inst);
+            if let Some(tracker) = self.margin.as_mut() {
+                tracker.set_isolated(&sym, actual);
+            }
+        }
+    }
+
+    /// 单个 instrument 的判定价:`mark_cache` → 本 bar 的 mid → 调用方给的兜底价
+    ///
+    /// 保证金核定与快照共用同一套顺序,避免"核定用均价、判定用 mark"导致
+    /// 两边算出不同的保证金需求。
+    fn judged_price(&self, instrument: &Instrument, fallback: f64) -> f64 {
+        self.bt_state
+            .mark_cache
+            .get(instrument)
+            .map(|m| m.as_f64())
+            .or_else(|| self.bt_state.bar_mid_by_instrument.get(instrument).copied())
+            .unwrap_or(fallback)
+    }
+
+    /// 逐 bar 保证金检查:判定 → 强平减仓 → 释放保证金 → 记录事件。
+    ///
+    /// 返回本 bar 产生的事件(同时累积到 `self.liquidation_events`)。
+    /// 未启用保证金(tracker 为 None)时是 no-op,保证零行为变化。
+    ///
+    /// 调用时机:bar 末 funding 结算之后(设计 §2.3 的执行顺序)。
+    pub fn check_margin(&mut self) -> Vec<LiquidationEvent> {
+        if self.margin.is_none() {
+            return Vec::new();
+        }
+        // 只保留最近一次检查的强平品种:worker 在下一根 bar 消费这份快照,
+        // 陈旧数据会让正常品种被误判为"刚被强平"。
+        self.liquidated_last_bar.clear();
+        // 0) 先按最新判定价把逐仓子账户补足/释放:否则刚开仓的逐仓品种子账户为 0,
+        //    权益只剩浮盈亏,任何微小浮亏都会被误判强平
+        self.sync_isolated_margins();
+        // 1) 快照(不可变借用,函数返回后即释放)
+        let snapshot = self.margin_snapshot();
+        // 2) 计划(只读):判定与执行分离,避免判定期间账本被改写。
+        //    这里**不能**在 actions 为空时提前 return：下方穿仓兜底与是否发生
+        //    强平无关，NAV < 0 必须每 bar 修正，否则 final_nav 可以为负。
+        let actions = self
+            .margin
+            .as_ref()
+            .map(|tracker| tracker.plan(&snapshot))
+            .unwrap_or_default();
+
+        let timestamp_ns = self.config.clock.now().nanos;
+        let mut events = Vec::new();
+        for act in actions {
+            let price = snapshot.prices.get(&act.symbol).copied().unwrap_or(0.0);
+            if price <= 0.0 {
+                continue;
+            }
+            let Some(inst) = self.instrument_for_symbol(&act.symbol) else {
+                continue;
+            };
+            let before_qty = self.get_position(&inst);
+            let filled = self.risk_reduce(&inst, act.target_qty, act.fee_rate);
+            if filled == 0 {
+                continue;
+            }
+            // 强平后把目标位清零：否则下一根 bar 的 begin_bar 会按旧 target 原样开回来
+            if let Some(leg) = self.bt_state.legs.get_mut(&inst) {
+                leg.target_position = 0.0;
+            }
+            self.liquidated_last_bar.insert(act.symbol.clone());
+            let after_qty = self.get_position(&inst);
+            let reduced_qty = (before_qty - after_qty).abs();
+            let fee = reduced_qty * price * act.fee_rate;
+
+            if act.margin_mode == MarginMode::Isolated {
+                let held = self.isolated_balance(&inst);
+                self.margin
+                    .as_mut()
+                    .expect("margin 存在性已在上方判定")
+                    .settle_after_reduce(&act.symbol, after_qty.abs() * price, fee);
+                let kept = self
+                    .margin
+                    .as_ref()
+                    .expect("margin 存在性已在上方判定")
+                    .isolated(&act.symbol);
+                // 引擎账本镜像 tracker:把"扣掉的强平费 + 多余保证金"一起搬回 cash。
+                // 强平费在 apply_fill 里已从 cash 扣过一次,这里的多释放部分正是把它补回,
+                // 等效于"逐仓强平费从子账户扣"(设计 §2.3),NAV 只损失一次费用。
+                if held > kept {
+                    self.release_isolated(&inst, held - kept);
+                }
+            }
+
+            events.push(LiquidationEvent {
+                timestamp_ns,
+                symbol: act.symbol.clone(),
+                margin_mode: act.margin_mode,
+                tier_from: act.tier_from,
+                tier_to: act.tier_to,
+                reduced_qty,
+                price,
+                fee,
+                // 实际已清零就以实际为准,避免 tracker 计划与成交结果不一致时事件误导
+                reason: if after_qty.abs() < 1e-12 {
+                    LiquidateReason::Depleted
+                } else {
+                    act.reason
+                },
+                price_basis: "close",
+            });
+        }
+        self.liquidation_events.extend(events.iter().cloned());
+
+        // 3) 穿仓兜底:强平后账户权益仍为负 → 保险基金把 NAV 抬回 0。
+        //    缺口只在这里记一次(settle_after_reduce 不返回缺口),避免双重计入;
+        //    设计 §2.5 要求 final_nav >= 0 成为不变量。
+        let nav = self.compute_nav(self.config.clock.now(), 0.0);
+        if nav < 0.0 {
+            self.bt_state.cash += -nav;
+            self.insurance_fund_loss += -nav;
+            // 账户已穿仓:保险基金兜底之后立即冻结,否则策略会在 0 权益上继续
+            // 开仓→强平→兜底,产生一串"僵尸交易"与无上限的保险基金损失。
+            self.frozen = true;
+        }
+
+        events
+    }
+
+    /// 因可用保证金不足而被缩量的开仓次数（供结果层 Task 6 透出）
+    pub fn margin_shortfall_count(&self) -> u32 {
+        self.margin_shortfall_count
+    }
+
+    /// 账户是否已穿仓冻结（保险基金兜底后置位，冻结后只允许减仓）
+    ///
+    /// 编排层据此停止策略决策：让已经破产的账户继续交易只会产出
+    /// 一串"同一根 bar 开仓又强平"的僵尸记录。
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    /// 上一次保证金检查中被强平的品种（"BASE/QUOTE"）
+    ///
+    /// 编排层在下一根 bar 用它区分"策略主动开仓"与"Hold 沿用旧目标"，
+    /// 避免刚被强平的品种在同 bar 被原样开回来。
+    pub fn liquidated_symbols(&self) -> &HashSet<String> {
+        &self.liquidated_last_bar
+    }
+
+    /// 把 tracker 的 "BASE/QUOTE" 字符串映射回引擎内部 `Instrument`
+    ///
+    /// 只从 `position_states` 找:强平只针对有持仓的品种,已清仓的条目
+    /// 仍留在 map 里(quantity=0),但不会产生新的强平动作。
+    fn instrument_for_symbol(&self, symbol: &str) -> Option<Instrument> {
+        self.bt_state
+            .position_states
+            .keys()
+            .find(|inst| instrument_key(inst) == symbol)
+            .cloned()
+    }
+
+    /// 构建保证金判定所需的只读快照
+    ///
+    /// 判定价优先级:`mark_cache` → 本 bar 的 `bar_mid_by_instrument` → 持仓 `avg_cost`。
+    /// 最后一级兜底是必要的:两者都没有时(纯离线 bar 回测未推 mark)若返回 0,
+    /// 名义会被算成 0、维持保证金恒为 0,强平永远不触发。
+    fn margin_snapshot(&self) -> MarginSnapshot {
+        let mut positions = HashMap::new();
+        let mut prices = HashMap::new();
+        let mut unrealized = HashMap::new();
+        for (inst, pos) in &self.bt_state.position_states {
+            if pos.quantity.abs() < 1e-12 {
+                continue; // 已清仓,不参与名义 / 维持保证金求和
+            }
+            let sym = instrument_key(inst);
+            // 判定价复用 `judged_price`:保证金核定与强平判定必须用同一套兜底顺序
+            let price = self.judged_price(inst, pos.avg_cost);
+            positions.insert(sym.clone(), pos.quantity);
+            prices.insert(sym.clone(), price);
+            unrealized.insert(sym, (price - pos.avg_cost) * pos.quantity);
+        }
+        MarginSnapshot {
+            positions,
+            prices,
+            unrealized,
+            cash: self.bt_state.cash,
+            // 全仓权益直接用 NAV（cash 只记自由余额，不含持仓名义）
+            nav: self.compute_nav(self.config.clock.now(), 0.0),
+        }
+    }
+
     /// 0.5.0 新增(Phase D):手动触发 rebalance
     ///
     /// 遍历 `bt_state.legs`:
@@ -1880,7 +2497,92 @@ impl BacktestEngine {
             }
             // delta > 0 ⇒ Buy(增加持仓);delta < 0 ⇒ Sell(减少持仓)
             let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
-            let qty = delta.abs();
+            let mut qty = delta.abs();
+            // 逐仓开仓/加仓：所需保证金必须由自由余额支撑，不足则缩量，
+            // 避免保证金划转把 cash 扣成负数（减仓方向不受此限制）。
+            let increasing = current.abs() < 1e-12 || delta.signum() == current.signum();
+            // 穿仓冻结后只允许减仓：任何开仓/加仓一律拒绝，避免在 0 权益上
+            // 反复开仓→强平→保险基金兜底
+            if self.frozen && increasing {
+                continue;
+            }
+            if increasing && self.is_margined(&instrument) {
+                let sym = instrument_key(&instrument);
+                let margin_info = self.margin.as_ref().map(|t| {
+                    (
+                        t.mode_of(&sym),
+                        t.specs()
+                            .get(&sym)
+                            .map(|s| s.leverage.max(1.0))
+                            .unwrap_or(1.0),
+                    )
+                });
+                if let Some((mode, leverage)) = margin_info {
+                    let price = self
+                        .bt_state
+                        .bar_mid_by_instrument
+                        .get(&instrument)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if price > 0.0 {
+                        // 可用资金要同时覆盖"保证金占用 + 手续费"：只按名义/杠杆
+                        // 缩量会在成交价略高于 mid 时把 cash 压成负数。
+                        let fee_rate = self.config.fee_config.taker_rate;
+                        let affordable = match mode {
+                            // 逐仓：可用额是该子账户之外的自由现金
+                            MarginMode::Isolated => {
+                                self.bt_state.cash.max(0.0) / (price * (1.0 / leverage + fee_rate))
+                            }
+                            // 全仓：可用保证金 = NAV − 已占用的初始保证金。
+                            // ponytail: 初始保证金按 notional/leverage 估算，未按档位表
+                            // 逐档取 IMR（档位只影响维持保证金/强平口径），需要精确 IM
+                            // 时升级为 per-bracket initial rate。
+                            MarginMode::Cross => {
+                                let used_im: f64 = self
+                                    .bt_state
+                                    .position_states
+                                    .iter()
+                                    .filter(|(inst, pos)| {
+                                        pos.quantity.abs() >= 1e-12
+                                            && self.is_margined(inst)
+                                            && self
+                                                .margin
+                                                .as_ref()
+                                                .map(|t| {
+                                                    t.mode_of(&instrument_key(inst))
+                                                        == MarginMode::Cross
+                                                })
+                                                .unwrap_or(false)
+                                    })
+                                    .map(|(inst, pos)| {
+                                        let lev = self
+                                            .margin
+                                            .as_ref()
+                                            .and_then(|t| {
+                                                t.specs()
+                                                    .get(&instrument_key(inst))
+                                                    .map(|s| s.leverage.max(1.0))
+                                            })
+                                            .unwrap_or(1.0);
+                                        pos.quantity.abs() * self.judged_price(inst, pos.avg_cost)
+                                            / lev
+                                    })
+                                    .sum();
+                                let nav = self.compute_nav(self.config.clock.now(), price);
+                                (nav - used_im).max(0.0) / (price * (1.0 / leverage + fee_rate))
+                            }
+                        };
+                        if qty > affordable {
+                            qty = affordable.max(0.0);
+                            self.margin_shortfall_count += 1;
+                        }
+                    }
+                }
+            }
+            if qty <= 1e-12 {
+                // 自由余额完全撑不起本次开仓：本 bar 不开，计数已在上面记录
+                continue;
+            }
             // 0.5.0 修:按 instrument 类型分派 `Order::spot` / `Order::swap`,
             // 之前一律用 `Order::spot` 导致 perp leg 的 `instrument` 字段被错
             // 设为 Spot,路由到 spot book,永远不成交。
@@ -1920,6 +2622,9 @@ impl BacktestEngine {
         if triggered > 0 {
             self.last_rebalance_bar_id = self.bar_id;
         }
+        // 开仓/调仓当 bar 就按最新判定价核定逐仓保证金,而不是拖到下一次 check_margin;
+        // 放在这里也覆盖了 begin_bar 收尾的自动 rebalance 路径(每 bar 顺带 mark 一次)。
+        self.sync_isolated_margins();
         triggered
     }
 
@@ -2036,6 +2741,8 @@ impl BacktestEngine {
             equity_curve: self.bt_state.equity_curve.clone(),
             // 0.7.1 新增:bar 末 NAV 曲线(每 bar 一帧,供 Sharpe / max_drawdown 重算)
             bar_nav_curve: self.bt_state.bar_nav_curve.clone(),
+            // 0.21.0 新增:bar 末 balance 曲线(每 bar 一帧,与 bar_nav_curve 逐帧对齐)
+            bar_balance_curve: self.bt_state.bar_balance_curve.clone(),
             nav_peak,
             max_drawdown_pct,
             win_rate,
@@ -2051,7 +2758,52 @@ impl BacktestEngine {
             rebalances_triggered: self.rebalances_triggered,
             // 0.7.0 新增(Phase 4):从 positions + sharpe_ratio 派生风险敞口
             risk_metrics,
+            // 0.21.0 新增:保证金 / 强平(judge 口径固定 close)
+            liquidation_events: self.liquidation_events.clone(),
+            insurance_fund_loss: self.insurance_fund_loss,
+            price_basis: "close".to_string(),
+            margin_applied: self.margin.is_some(),
+            margin_specs_effective: self.margin_specs_effective(),
+            liquidation_count: self.liquidation_events.len() as u32,
+            margin_shortfall_count: self.margin_shortfall_count,
         }
+    }
+
+    /// 实际生效的保证金规格（按 symbol 排序，保证结果可复现）
+    ///
+    /// HashMap 迭代顺序不稳定，直接透出会让前端标签顺序每次不同；
+    /// 排序成本极低（品种数个位数），换来结果可逐字对比。
+    fn margin_specs_effective(&self) -> Vec<EffectiveMarginSpec> {
+        let Some(tracker) = self.margin.as_ref() else {
+            return Vec::new();
+        };
+        let mut specs: Vec<EffectiveMarginSpec> = tracker
+            .specs()
+            .iter()
+            .map(|(symbol, spec)| EffectiveMarginSpec {
+                symbol: symbol.clone(),
+                leverage: spec.leverage,
+                margin_mode: match spec.mode {
+                    MarginMode::Isolated => "isolated",
+                    MarginMode::Cross => "cross",
+                }
+                .to_string(),
+                bracket_source: spec.bracket_source.clone(),
+            })
+            .collect();
+        specs.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        specs
+    }
+}
+
+/// 引擎内部 `Instrument` → 保证金模块使用的 "BASE/QUOTE" key
+///
+/// 保证金配置(`margin_specs`)全链路统一用字符串 key,避免 `Spot` / `Swap`
+/// 同名品种在 tracker 里各占一份账本;回测单品种单合约,不存在歧义。
+fn instrument_key(inst: &Instrument) -> String {
+    match inst {
+        Instrument::Spot(s) => format!("{}/{}", s.base.as_str(), s.quote.as_str()),
+        Instrument::Swap(s) => format!("{}/{}", s.base.as_str(), s.quote.as_str()),
     }
 }
 
@@ -2123,6 +2875,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         }
     }
 
@@ -2667,6 +3420,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: true,
+            margin_specs: std::collections::HashMap::new(),
         };
         let mut engine = BacktestEngine::new(config, q);
         let result = engine.run();
@@ -2749,6 +3503,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: true,
+            margin_specs: std::collections::HashMap::new(),
         };
         let mut engine = BacktestEngine::new(config, q);
         let result = engine.run();
@@ -4292,6 +5047,94 @@ mod tests {
         );
     }
 
+    // ── 0.21.0 新增:bar_balance_curve 存款曲线 ─────────────
+
+    /// 0.21.0:balance(= cash + Σ(qty × avg_cost))与 NAV 同点采样,
+    /// 且恒等式 `nav - balance == 浮盈` 成立。
+    ///
+    /// 场景:以 100 买入 1 BTC(fee 0.001 → 0.1),mark 先等于成本价、后涨到 110。
+    /// - 开仓后:balance = 100000 - 0.1(仅手续费),与成交价无关
+    /// - mark == avg_cost 时:nav == balance(无浮盈)
+    /// - mark 涨到 110:nav 涨 10,balance 不变 ⇒ nav - balance = 10
+    #[test]
+    fn bar_balance_curve_tracks_realized_pnl_only() {
+        let btc_spot = btc_spot_inst();
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // 卖单挂簿(无对手方的前半),买单吃单 → 1 笔 fill @ 100
+        let sell = make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0);
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(sell),
+        ));
+        let buy = make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0);
+        q.push(b.order(Timestamp::from_nanos(2_000), 2, OrderAction::Submitted(buy)));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        // 先消费 fill 事件,保证首个 bar 采样时持仓/手续费已入账
+        engine.run();
+
+        // bar 1:mark = 100(== 开仓均价)⇒ 无浮盈
+        engine.set_clock(Timestamp::from_nanos(1_000_000_000));
+        engine.begin_bar(100.0, btc_spot.clone());
+        let r1 = engine.run();
+
+        assert_eq!(r1.bar_nav_curve.len(), 1, "1 次 begin_bar 应采 1 帧 NAV");
+        assert_eq!(
+            r1.bar_balance_curve.len(),
+            r1.bar_nav_curve.len(),
+            "balance 曲线必须与 bar_nav_curve 逐帧对齐,got {} vs {}",
+            r1.bar_balance_curve.len(),
+            r1.bar_nav_curve.len()
+        );
+        let (_, nav1) = r1.bar_nav_curve[0];
+        let (_, bal1) = r1.bar_balance_curve[0];
+        // 持仓成本(+100)与 cash 支出(-100)抵消,只剩手续费 0.1
+        assert!(
+            (bal1 - 99_999.9).abs() < 1e-6,
+            "开仓后 balance 应 = initial_cash - fee = 99999.9,got {bal1}"
+        );
+        assert!(
+            (nav1 - bal1).abs() < 1e-6,
+            "mark == avg_cost 时应无浮盈,got nav-balance = {}",
+            nav1 - bal1
+        );
+
+        // bar 2:mark 涨到 110 ⇒ 浮盈 10,balance 不动
+        engine.set_clock(Timestamp::from_nanos(2_000_000_000));
+        engine.begin_bar(110.0, btc_spot.clone());
+        let r2 = engine.run();
+
+        assert_eq!(
+            r2.bar_balance_curve.len(),
+            2,
+            "2 次 begin_bar 应采 2 帧 balance"
+        );
+        let (_, nav2) = r2.bar_nav_curve[1];
+        let (_, bal2) = r2.bar_balance_curve[1];
+        assert!(
+            (bal2 - 99_999.9).abs() < 1e-6,
+            "持仓期间 balance 不应随价格变化,got {bal2}"
+        );
+        assert!(
+            (nav2 - bal2 - 10.0).abs() < 1e-6,
+            "mark 110 ⇒ 浮盈应为 10,got {}",
+            nav2 - bal2
+        );
+    }
+
+    /// 0.21.0:未调 begin_bar 时两条曲线都应空(采样点同一来源)。
+    #[test]
+    fn bar_balance_curve_empty_without_begin_bar() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let r = engine.run();
+        assert!(
+            r.bar_balance_curve.is_empty(),
+            "未调 begin_bar 时 balance 曲线应为空"
+        );
+    }
+
     // ── 0.8.0 Phase 2.4 B4 新增:双曲线决策落地验证 ─────────────
 
     /// 0.8.0 B4:验证 `RunResult` 整体 doc 含双曲线对比表
@@ -4589,6 +5432,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         };
 
         // 空队列:跑通即说明 routing 集成无 compile/runtime 问题
@@ -4620,6 +5464,7 @@ mod tests {
             initial_cash: 100_000.0,
             fee_config: FeeConfig::default(),
             force_liquidate: false,
+            margin_specs: std::collections::HashMap::new(),
         };
 
         // 入队 BTC 卖单
@@ -4637,5 +5482,973 @@ mod tests {
         assert_eq!(result.events_processed, 1);
         assert_eq!(result.orders_accepted, 1, "router 应把单送进 L1 子引擎挂簿");
         assert_eq!(result.fills, 0, "无对手方,无 fill");
+    }
+
+    // ── 0.21.0 新增:apply_fill 维护 open_fill_ids 并写入 trade ─────
+
+    /// 状态 1（开仓）+ 状态 3（全平）：entry_fill_ids=[0], exit_fill_ids=[1]
+    #[test]
+    fn test_apply_fill_tracks_open_fill_ids() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：Sell 挂簿 + Buy 吃单 → 开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1：Buy 挂簿 + Sell 吃单 → 全平
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.fills_detail[0].fill_id, 0);
+        assert_eq!(result.fills_detail[1].fill_id, 1);
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1]);
+    }
+
+    /// 状态 2（同向加仓）：两笔开仓 fill 都进 entry_fill_ids
+    #[test]
+    fn test_apply_fill_same_direction_add_appends_fill_ids() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1：同向加仓到 2
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 2：全平 2
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0, 1]);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![2]);
+    }
+
+    /// FLAT_TO_FLAT：开多 2 → 部分平 1 → 全平 1，只输出 1 条聚合 TradeRecord
+    #[test]
+    fn test_apply_fill_partial_close_shares_entry_fill_ids() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：开多 2
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        // fill 1：部分平 1，剩 1
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        // fill 2：平剩余 1
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        // FLAT_TO_FLAT: 只聚合输出 1 条 TradeRecord
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1, 2]);
+        // 聚合净量 = -2 (平多),单位 ×1e6
+        assert_eq!(result.trades[0].net_quantity, -2_000_000);
+    }
+
+    /// 状态 5（反手）：同一 fill 既是旧 trade 的 exit_fill_ids 元素，又是新仓的 open fill
+    #[test]
+    fn test_apply_fill_reversal_fill_spans_both_cycles() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0：开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1：Buy 2 挂簿 + Sell 2 吃单 → 平多 1 并反手开空 1
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+        // fill 2：平掉反手后的空头，验证新仓 open fill = 1
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 2);
+        // 旧多头：开仓 fill 0，平仓（反手）fill 1
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1]);
+        // 新空头：开仓 fill 复用反手那笔 fill 1
+        assert_eq!(result.trades[1].entry_fill_ids, vec![1]);
+        assert_eq!(result.trades[1].exit_fill_ids, vec![2]);
+    }
+
+    // ── FLAT_TO_FLAT 新增测试 ──────────────────────────
+
+    /// 开多 1 @ 100 → 部分平 0.5 @ 110 (pnl=5) → 平剩余 0.5 @ 120 (pnl=10)
+    /// 应聚合为 1 条 TradeRecord,realized_pnl=15_000_000,exit_fill_ids=[1,2]
+    #[test]
+    fn test_flat_to_flat_cumulative_pnl() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0: 开多 1 @ 100
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1: 部分平 0.5 @ 110 (pnl=(110-100)*0.5*1=5)
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 110.0, 0.5)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 110.0, 0.5)),
+        ));
+        // fill 2: 平剩余 0.5 @ 120 (pnl=(120-100)*0.5*1=10)
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Buy, 120.0, 0.5)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Sell, 120.0, 0.5)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 1);
+        let t = &result.trades[0];
+        assert_eq!(t.entry_fill_ids, vec![0]);
+        assert_eq!(t.exit_fill_ids, vec![1, 2]);
+        assert_eq!(t.realized_pnl, 15_000_000); // 5+10
+        assert_eq!(t.net_quantity, -1_000_000); // 平多 1
+    }
+
+    /// 开多 1 → 反手 fill（平多 1 + 开空 1）→ 平空 1
+    /// trades.len()=2,旧多头 exit_fill_ids=[反手 fill],新空头 exit_fill_ids=[平空 fill]
+    #[test]
+    fn test_flat_to_flat_reversal_splits_fill() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        // fill 0: 开多 1
+        q.push(b.order(
+            Timestamp::from_nanos(1_000),
+            1,
+            OrderAction::Submitted(make_limit_order(1, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(2_000),
+            2,
+            OrderAction::Submitted(make_limit_order(2, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+        // fill 1: Buy 2 挂簿 + Sell 2 吃单 → 平多 1 并反手开空 1
+        q.push(b.order(
+            Timestamp::from_nanos(3_000),
+            3,
+            OrderAction::Submitted(make_limit_order(3, "BTC", "USDT", Side::Buy, 100.0, 2.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(4_000),
+            4,
+            OrderAction::Submitted(make_limit_order(4, "BTC", "USDT", Side::Sell, 100.0, 2.0)),
+        ));
+        // fill 2: 平掉反手后的空头
+        q.push(b.order(
+            Timestamp::from_nanos(5_000),
+            5,
+            OrderAction::Submitted(make_limit_order(5, "BTC", "USDT", Side::Sell, 100.0, 1.0)),
+        ));
+        q.push(b.order(
+            Timestamp::from_nanos(6_000),
+            6,
+            OrderAction::Submitted(make_limit_order(6, "BTC", "USDT", Side::Buy, 100.0, 1.0)),
+        ));
+
+        let result = BacktestEngine::new(simple_config(), q).run();
+        assert_eq!(result.trades.len(), 2);
+        // 旧多头
+        assert_eq!(result.trades[0].entry_fill_ids, vec![0]);
+        assert_eq!(result.trades[0].exit_fill_ids, vec![1]);
+        assert_eq!(result.trades[0].net_quantity, -1_000_000); // 平多
+        // 新空头
+        assert_eq!(result.trades[1].entry_fill_ids, vec![1]);
+        assert_eq!(result.trades[1].exit_fill_ids, vec![2]);
+        assert_eq!(result.trades[1].net_quantity, 1_000_000); // 平空
+    }
+
+    // ── 逐仓分账账本(NAV 口径) ─────────────────────────────
+
+    /// 逐仓划转是 `cash ↔ isolated` 的内部搬运,NAV / balance 都必须不变
+    #[test]
+    fn nav_unchanged_by_isolated_transfer() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let inst = btc_spot_inst();
+        engine.begin_bar(100.0, inst.clone());
+        let ts = Timestamp::from_nanos(0);
+        let nav_before = engine.compute_nav(ts, 0.0);
+        let balance_before = engine.compute_balance();
+
+        engine.deposit_isolated(&inst, 1_000.0); // 从 cash 划入子账户
+        assert_eq!(engine.isolated_balance(&inst), 1_000.0);
+        // 划转本身不改 NAV / balance(空账本时公式与旧版逐位一致)
+        assert_eq!(engine.compute_nav(ts, 0.0), nav_before);
+        assert_eq!(engine.compute_balance(), balance_before);
+
+        engine.release_isolated(&inst, 1_000.0); // 释放回 cash
+        assert_eq!(engine.isolated_balance(&inst), 0.0);
+        assert_eq!(engine.compute_nav(ts, 0.0), nav_before);
+        assert_eq!(engine.compute_balance(), balance_before);
+    }
+
+    /// 释放金额超过子账户余额时夹到余额,不产生负余额
+    #[test]
+    fn release_isolated_clamps_to_balance() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let inst = btc_spot_inst();
+        engine.deposit_isolated(&inst, 500.0);
+        let cash_before = engine.bt_state.cash;
+        engine.release_isolated(&inst, 10_000.0);
+        assert_eq!(engine.isolated_balance(&inst), 0.0);
+        assert!((engine.bt_state.cash - (cash_before + 500.0)).abs() < 1e-9);
+        // 余额已清零,再次释放是 no-op
+        engine.release_isolated(&inst, 100.0);
+        assert!((engine.bt_state.cash - (cash_before + 500.0)).abs() < 1e-9);
+    }
+
+    // ── risk_reduce(强平减仓) ─────────────────────────────
+
+    /// 强平减仓必须绕过 bar guard、只减不增、永不反手、不计入 rebalances
+    #[test]
+    fn risk_reduce_bypasses_bar_guard_and_never_flips() {
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 预挂卖单 1.0 @ 50_000:开仓市价买吃它
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 50_000.0, 1.0);
+        // 预挂买单 1.0 @ 49_990:留在 book 上,给减仓市价卖吃(低于卖价不会先撮合)
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(49_990.0),
+                },
+                Quantity::from_f64(1.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.run();
+        engine.with_auto_rebalance(1e-6);
+        engine.begin_bar(50_000.0, inst.clone()); // bar_id = 1
+        engine.set_target_position(inst.clone(), 1.0);
+        assert_eq!(engine.rebalance_to_target(None), 1);
+        // 同 bar 再 rebalance:被 bar_id guard 拦掉(这正是强平不能走 rebalance 的原因)
+        assert_eq!(engine.rebalance_to_target(None), 0);
+        assert!((engine.get_position(&inst) - 1.0).abs() < 1e-9);
+        let rebalances_before = engine.rebalances_triggered;
+
+        // 目标 -5 会被夹到 0:不允许反手开空
+        let filled = engine.risk_reduce(&inst, -5.0, 0.004);
+        assert_eq!(filled, 1);
+        assert_eq!(engine.get_position(&inst), 0.0);
+        assert_eq!(
+            engine.rebalances_triggered, rebalances_before,
+            "强平减仓不应累加 rebalances_triggered"
+        );
+    }
+
+    /// 无持仓时 risk_reduce 是 no-op
+    #[test]
+    fn risk_reduce_is_noop_without_position() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let inst = btc_spot_inst();
+        engine.begin_bar(100.0, inst.clone());
+        assert_eq!(engine.risk_reduce(&inst, 0.0, 0.004), 0);
+        assert_eq!(engine.risk_reduce(&inst, -1.0, 0.004), 0);
+    }
+
+    // ── 保证金检查与强平(逐仓) ─────────────────────────
+
+    /// 逐仓部分强平后必须释放多余保证金,否则下一 bar 再次判定爆仓(连锁误强平)
+    #[test]
+    fn liquidation_releases_margin_and_does_not_chain() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 卖 1.2 @ 50_050 供开仓市价买吃;买 5.0 @ 49_950 留在 book 供强平卖单吃
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 50_050.0, 1.2);
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(49_950.0),
+                },
+                Quantity::from_f64(5.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        // 生产路径由 `config.margin_specs` 构造 tracker;测试直接注入等价 tracker,
+        // 子账户余额交给 `sync_isolated_margins` 按开仓价核定,不再手工 set_isolated
+        engine.margin = Some(MarginTracker::new(HashMap::from([(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 100.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![
+                    Bracket {
+                        notional_floor: 0.0,
+                        notional_cap: Some(50_000.0),
+                        mmr: 0.004,
+                        cum: 0.0,
+                        liquidation_fee_rate: 0.004,
+                        max_leverage: 125.0,
+                    },
+                    // 第二档 MMR 放大到 10%:让 6 万名义的维持保证金远高于子账户权益,
+                    // 触发"减到下一档下限即可恢复"的部分强平
+                    Bracket {
+                        notional_floor: 50_000.0,
+                        notional_cap: Some(600_000.0),
+                        mmr: 0.1,
+                        cum: 0.0,
+                        liquidation_fee_rate: 0.004,
+                        max_leverage: 100.0,
+                    },
+                ],
+                bracket_source: "default".into(),
+            },
+        )])));
+        engine.run();
+        engine.set_target_position(inst.clone(), 1.2);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        assert!((engine.get_position(&inst) - 1.2).abs() < 1e-9);
+        // 开仓当 bar 即完成划转:1.2 × 50_050 / 100x = 600.6
+        assert!((engine.isolated_balance(&inst) - 600.6).abs() < 1e-9);
+
+        // bar mid = 49_950 → 名义 59_940、维持保证金 1_194 > 权益 480.6 → 触发
+        engine.begin_bar(49_950.0, inst.clone());
+        let events = engine.check_margin();
+        assert_eq!(events.len(), 1, "应产生 1 条部分强平事件");
+        let ev = &events[0];
+        assert_eq!(ev.symbol, "BTC/USDT");
+        assert_eq!(ev.margin_mode, MarginMode::Isolated);
+        assert_eq!(ev.reason, LiquidateReason::Partial);
+        assert_eq!(ev.tier_from, 1);
+        assert_eq!(ev.tier_to, 0);
+        assert!((ev.price - 49_950.0).abs() < 1e-9);
+        assert!(ev.reduced_qty > 0.0 && ev.reduced_qty < 1.2);
+        assert!(ev.fee > 0.0);
+        assert_eq!(ev.price_basis, "close");
+        // 剩余名义 5 万 / 100x = 500 保证金;多余部分已释放回 cash
+        assert!((engine.isolated_balance(&inst) - 500.0).abs() < 1.0);
+        assert_eq!(engine.insurance_fund_loss, 0.0);
+
+        // 同一价格再检查一次:多余保证金已释放 → 不应再有事件(不连锁)
+        assert!(
+            engine.check_margin().is_empty(),
+            "部分强平后释放保证金,不应连锁触发第二次强平"
+        );
+    }
+
+    /// 逐仓开仓后子账户保证金真的划入,小浮亏不应被误判强平
+    #[test]
+    fn isolated_position_is_not_liquidated_right_after_open() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 卖 1.0 @ 50_000 供开仓吃;买 5.0 @ 49_000 留在 book(若误判强平会真的成交)
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 50_000.0, 1.0);
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(49_000.0),
+                },
+                Quantity::from_f64(5.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.margin = Some(MarginTracker::new(HashMap::from([(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 1.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.004,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            },
+        )])));
+        engine.run();
+        engine.set_target_position(inst.clone(), 1.0);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        // 1x:1.0 × 50_000 / 1 = 50_000 保证金已从 cash 划入子账户
+        assert!((engine.isolated_balance(&inst) - 50_000.0).abs() < 1e-9);
+
+        // 价格 50_000 → 49_990,浮亏 10 美元,远低于维持保证金
+        engine.begin_bar(49_990.0, inst.clone());
+        let events = engine.check_margin();
+        assert!(events.is_empty(), "刚开仓的小浮亏不应触发强平");
+        assert!(
+            engine.isolated_balance(&inst) > 0.0,
+            "逐仓子账户必须真的有余额"
+        );
+        assert!((engine.isolated_balance(&inst) - 49_990.0).abs() < 1e-6);
+        assert_eq!(engine.insurance_fund_loss, 0.0);
+        assert!(engine.compute_nav(Timestamp::from_nanos(0), 0.0) > 0.0);
+    }
+
+    /// 极端下跌穿仓:强平后 NAV 被保险基金抬到 0,缺口只记一次
+    #[test]
+    fn isolated_liquidation_zeroes_nav_not_negative() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut q = EventQueue::new();
+        let mut b = EventBuilder::new(0);
+        let inst = btc_spot_inst();
+        // 200 张 @ 1_000 开多(名义 20 万,远超 10 万本金);价格跌到 10 即穿仓
+        push_sell_order(&mut q, &mut b, 1, inst.clone(), 1_000.0, 200.0);
+        q.push(b.order(
+            Timestamp::from_nanos(500),
+            2,
+            OrderAction::Submitted(Order::spot(
+                2,
+                "BTC",
+                "USDT",
+                Side::Buy,
+                OrderType::Limit {
+                    price: Price::from_f64(10.0),
+                },
+                Quantity::from_f64(200.0),
+                TimeInForce::GTC,
+            )),
+        ));
+
+        let mut engine = BacktestEngine::new(simple_config(), q);
+        engine.margin = Some(MarginTracker::new(HashMap::from([(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 100.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.004,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            },
+        )])));
+        engine.run();
+        engine.set_target_position(inst.clone(), 200.0);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 1);
+        assert!((engine.isolated_balance(&inst) - 2_000.0).abs() < 1e-9);
+
+        engine.begin_bar(10.0, inst.clone());
+        let events = engine.check_margin();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, LiquidateReason::Depleted);
+        assert_eq!(events[0].reduced_qty, 200.0);
+        assert_eq!(engine.get_position(&inst), 0.0);
+        assert_eq!(engine.isolated_balance(&inst), 0.0);
+
+        // 穿仓缺口 = 开仓手续费 200 + 强平费 8 + 名义亏损 198_000 - 本金 100_000
+        assert_eq!(engine.insurance_fund_loss, 98_208.0);
+        assert_eq!(
+            engine.compute_nav(Timestamp::from_nanos(0), 0.0),
+            0.0,
+            "穿仓后 NAV 必须被写回 0,不能为负"
+        );
+    }
+
+    // ── 配置 / 结果字段(未启用保证金) ─────────────────────
+
+    /// 空 `margin_specs`:不构造 tracker,结果里的保证金字段为默认值
+    #[test]
+    fn run_result_has_empty_margin_fields_when_disabled() {
+        let mut engine = BacktestEngine::new(simple_config(), EventQueue::new());
+        let result = engine.run();
+        assert!(result.liquidation_events.is_empty());
+        assert_eq!(result.insurance_fund_loss, 0.0);
+        assert_eq!(result.price_basis, "close");
+        assert!(!result.margin_applied);
+        assert!(result.margin_specs_effective.is_empty());
+        assert_eq!(result.liquidation_count, 0);
+        assert_eq!(result.margin_shortfall_count, 0);
+        // 行为与旧版一致:无持仓、无事件时 NAV = initial_cash
+        assert_eq!(result.final_nav, 100_000.0);
+        assert!(engine.margin.is_none(), "空 specs 不应构造 tracker");
+        assert!(
+            engine.check_margin().is_empty(),
+            "未启用时 check_margin 是 no-op"
+        );
+    }
+
+    /// 非空 `margin_specs`:引擎构造 tracker(key 为 "BASE/QUOTE" 字符串)
+    #[test]
+    fn margin_specs_construct_tracker() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut config = simple_config();
+        config.margin_specs.insert(
+            "BTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 10.0,
+                mode: MarginMode::Isolated,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.005,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.001,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            },
+        );
+        let engine = BacktestEngine::new(config, EventQueue::new());
+        assert!(engine.margin.is_some());
+    }
+
+    /// 启用保证金时结果透出生效规格（含档位来源）与强平统计
+    #[test]
+    fn run_result_reports_effective_margin_specs() {
+        use crate::margin::{Bracket, MarginSpec};
+
+        let mut config = simple_config();
+        config.margin_specs.insert(
+            "LTC/USDT".to_string(),
+            MarginSpec {
+                leverage: 20.0,
+                mode: MarginMode::Cross,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.001,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            },
+        );
+        let mut engine = BacktestEngine::new(config, EventQueue::new());
+        let result = engine.run();
+
+        assert!(result.margin_applied);
+        assert_eq!(result.margin_specs_effective.len(), 1);
+        let spec = &result.margin_specs_effective[0];
+        assert_eq!(spec.symbol, "LTC/USDT");
+        assert_eq!(spec.leverage, 20.0);
+        assert_eq!(spec.margin_mode, "cross");
+        assert_eq!(spec.bracket_source, "default");
+        assert_eq!(
+            result.liquidation_count,
+            result.liquidation_events.len() as u32
+        );
+        assert_eq!(result.margin_shortfall_count, 0);
+    }
+
+    // ── 保证金账务（cash 只记自由余额）测试辅助 ─────────────
+
+    /// 带虚拟对手盘的测试引擎：`begin_bar` 会自动挂 10 层、每层 1 万张的盘口
+    fn new_test_engine(initial_cash: f64) -> BacktestEngine {
+        let mut config = simple_config();
+        config.initial_cash = initial_cash;
+        let mut engine = BacktestEngine::new(config, EventQueue::new());
+        engine.with_seed_liquidity(0.01, 10, 10_000.0);
+        engine
+    }
+
+    fn swap_inst(base: &str, quote: &str) -> Instrument {
+        Instrument::Swap(axon_core::types::SwapInstrument {
+            base: Symbol::from(base),
+            quote: Symbol::from(quote),
+            settle: axon_core::types::SwapSettle::UsdMargin,
+            contract_size: 1.0,
+        })
+    }
+
+    fn spot_inst(base: &str, quote: &str) -> Instrument {
+        Instrument::Spot(SpotInstrument {
+            base: Symbol::from(base),
+            quote: Symbol::from(quote),
+        })
+    }
+
+    impl BacktestEngine {
+        /// 测试内直接注入保证金 tracker（生产路径走 `config.margin_specs`）
+        fn set_margin_for_test(
+            &mut self,
+            instrument: &Instrument,
+            leverage: f64,
+            mode: MarginMode,
+        ) {
+            use crate::margin::{Bracket, MarginSpec};
+            let spec = MarginSpec {
+                leverage,
+                mode,
+                brackets: vec![Bracket {
+                    notional_floor: 0.0,
+                    notional_cap: None,
+                    mmr: 0.004,
+                    cum: 0.0,
+                    liquidation_fee_rate: 0.004,
+                    max_leverage: 125.0,
+                }],
+                bracket_source: "default".into(),
+            };
+            self.margin = Some(MarginTracker::new(HashMap::from([(
+                instrument_key(instrument),
+                spec,
+            )])));
+        }
+
+        fn cash_for_test(&self) -> f64 {
+            self.bt_state.cash
+        }
+
+        fn nav_for_test(&self) -> f64 {
+            self.compute_nav(self.config.clock.now(), 0.0)
+        }
+    }
+
+    /// 保证金模式开仓只扣手续费，不搬全额名义
+    #[test]
+    fn margined_open_does_not_drain_cash() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0); // 20x：名义 5000
+        engine.rebalance_to_target(Some(1e-6));
+        let cash = engine.cash_for_test();
+        // 开仓只扣手续费（约 5000 × 0.001 = 5），不扣名义
+        assert!((cash - 995.0).abs() < 1.0, "cash={cash}");
+        assert!(engine.get_position(&inst) > 0.0);
+    }
+
+    /// 全仓开仓按可用保证金缩量：NAV 100 / 1x 只能开约 1 张，不能开 10 张
+    ///
+    /// 修复前全仓分支没有可用保证金校验，NAV 归零后仍能开出巨额仓位，
+    /// 随即被强平并由保险基金兜底，形成僵尸循环。
+    #[test]
+    fn cross_open_is_clamped_by_available_margin() {
+        let mut engine = new_test_engine(100.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 1.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 10.0); // 10 张 = 1000 名义，但 NAV 只有 100
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(
+            engine.get_position(&inst) <= 1.05,
+            "全仓开仓必须按可用保证金缩量,pos={}",
+            engine.get_position(&inst)
+        );
+        assert_eq!(engine.margin_shortfall_count(), 1);
+    }
+
+    /// 穿仓后保险基金兜底 → 冻结；冻结后目标再调大也不会开仓
+    #[test]
+    fn frozen_account_rejects_new_positions_after_insurance_topup() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 100.0); // 名义 1 万，20x → IM 500
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(engine.get_position(&inst) > 0.0);
+        assert!(!engine.is_frozen());
+
+        // 价格跌到 1：浮亏远大于 NAV → 强平 + 保险基金兜底
+        engine.begin_bar(1.0, inst.clone());
+        let events = engine.check_margin();
+        assert!(!events.is_empty(), "应有强平事件");
+        assert!(engine.insurance_fund_loss > 0.0);
+        assert!(engine.is_frozen(), "穿仓兜底后账户必须冻结");
+
+        // 冻结后再要 100 张：引擎必须拒绝开仓
+        engine.set_target_position(inst.clone(), 100.0);
+        assert_eq!(engine.rebalance_to_target(Some(1e-6)), 0);
+        assert!(
+            engine.get_position(&inst).abs() < 1e-9,
+            "冻结后不允许开新仓"
+        );
+    }
+
+    /// 未启用保证金时保持旧现金流（买入扣全额名义）
+    #[test]
+    fn unmargined_open_keeps_legacy_cash_flow() {
+        let mut engine = new_test_engine(10_000.0);
+        let inst = spot_inst("BTC", "USDT");
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 10.0);
+        engine.rebalance_to_target(Some(1e-6));
+        // 旧口径：cash = 10000 - 1000 - fee
+        assert!(engine.cash_for_test() < 9_001.0);
+    }
+
+    /// 逐仓开仓按可用自由余额缩量，cash 不允许被保证金划转扣成负数
+    #[test]
+    fn isolated_open_is_clamped_by_available_cash() {
+        let mut engine = new_test_engine(100.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 1.0, MarginMode::Isolated);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 10.0); // 10 张 = 1000 名义，但只有 100 现金
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(engine.get_position(&inst) <= 1.05);
+        assert_eq!(engine.margin_shortfall_count(), 1);
+        assert!(engine.cash_for_test() >= 0.0);
+    }
+
+    /// 保证金品种的 NAV 只计浮盈亏：开仓不因名义而缩水，价格跌 1% 只亏 1% 名义
+    #[test]
+    fn margined_nav_tracks_unrealized_only() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0);
+        engine.rebalance_to_target(Some(1e-6));
+        let nav_open = engine.nav_for_test();
+        assert!((nav_open - 995.0).abs() < 2.0, "nav_open={nav_open}");
+
+        // 价格跌 1%：5000 名义亏 50，NAV ≈ 945
+        engine.begin_bar(99.0, inst.clone());
+        let nav_down = engine.nav_for_test();
+        assert!((nav_down - 945.0).abs() < 5.0, "nav_down={nav_down}");
+    }
+
+    /// 穿仓兜底与"本 bar 是否有强平动作"无关：NAV 为负一律写零
+    #[test]
+    fn nav_floored_even_without_liquidation_actions() {
+        let mut engine = new_test_engine(100.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0);
+        engine.rebalance_to_target(Some(1e-6));
+        // 极端下跌让 NAV 变负，但仓位已被清空 → 本 bar 没有强平动作
+        engine.begin_bar(1.0, inst.clone());
+        let _ = engine.check_margin();
+        let _ = engine.check_margin();
+        assert!(engine.nav_for_test() >= 0.0);
+        assert!(engine.insurance_fund_loss > 0.0);
+    }
+
+    /// 强平后记录品种并把 leg 目标清零，防止下一根 bar 按旧目标重开
+    #[test]
+    fn liquidated_symbol_is_recorded_and_target_zeroed() {
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        engine.set_margin_for_test(&inst, 20.0, MarginMode::Cross);
+        engine.begin_bar(100.0, inst.clone());
+        engine.set_target_position(inst.clone(), 50.0);
+        engine.rebalance_to_target(Some(1e-6));
+        assert!(engine.get_position(&inst) > 0.0);
+
+        // 价格从 100 跌到 1：NAV 深度为负，本 bar 必然强平
+        engine.begin_bar(1.0, inst.clone());
+        let events = engine.check_margin();
+        assert!(!events.is_empty(), "暴跌应产生强平事件");
+        assert!(
+            engine.liquidated_symbols().contains("LTC/USDT"),
+            "强平品种必须进入 liquidated_symbols"
+        );
+        assert_eq!(
+            engine.get_target_position(&inst),
+            Some(0.0),
+            "强平后 leg 目标必须清零，否则下一根 bar 原样开回来"
+        );
+        assert_eq!(engine.get_position(&inst), 0.0);
+    }
+
+    /// 受控行情：价格 100 → 98.8（-1.2%，120 根），策略恒定 50% 权益名义仓位。
+    ///
+    /// 返回 `(final_nav, total_pnl, 强平事件数, fills)`。
+    fn run_controlled_decline(leverage: f64, margin: bool) -> (f64, f64, usize, u64) {
+        const N: usize = 120;
+        let mut engine = new_test_engine(1_000.0);
+        let inst = swap_inst("LTC", "USDT");
+        if margin {
+            engine.set_margin_for_test(&inst, leverage, MarginMode::Cross);
+        }
+        for i in 0..N {
+            let px = 100.0 - 0.01 * i as f64;
+            engine.set_clock(Timestamp::from_nanos(i as i64 * 900_000_000_000));
+            engine.begin_bar(px, inst.clone());
+            // 恒定 50% 权益名义仓位（不随杠杆放大，与设计文档受控实验一致）
+            engine.set_target_position(inst.clone(), 0.5 * engine.nav_for_test() / px);
+            engine.rebalance_to_target(Some(1e-12));
+            engine.check_margin();
+        }
+        // 末尾再采样一帧，让 final_nav 反映最后一根 bar 的盯市
+        let px_last = 100.0 - 0.01 * (N - 1) as f64;
+        engine.set_clock(Timestamp::from_nanos(N as i64 * 900_000_000_000));
+        engine.begin_bar(px_last, inst.clone());
+        let result = engine.run();
+        (
+            result.final_nav,
+            result.total_pnl,
+            result.liquidation_events.len(),
+            result.fills,
+        )
+    }
+
+    /// 价格只跌 1.2% 时 20x 全仓不应爆仓，且 final_nav 必须为正
+    #[test]
+    fn controlled_slow_decline_20x_cross_does_not_liquidate() {
+        let (nav20, pnl20, events20, fills20) = run_controlled_decline(20.0, true);
+        println!(
+            "[controlled] 20x cross: pnl={pnl20:.6} final_nav={nav20:.6} events={events20} fills={fills20}"
+        );
+        assert_eq!(events20, 0, "价格仅跌 1.2%，不应产生强平事件");
+        assert!(nav20 > 0.0, "final_nav 必须为正，got {nav20}");
+    }
+
+    /// 同场景 1x 启用保证金与不启用保证金结果一致
+    #[test]
+    fn controlled_1x_margin_matches_unmargined() {
+        let (nav_off, pnl_off, events_off, fills_off) = run_controlled_decline(1.0, false);
+        let (nav_on, pnl_on, events_on, fills_on) = run_controlled_decline(1.0, true);
+        println!(
+            "[controlled] 1x off: pnl={pnl_off:.6} final_nav={nav_off:.6} events={events_off} fills={fills_off}"
+        );
+        println!(
+            "[controlled] 1x on : pnl={pnl_on:.6} final_nav={nav_on:.6} events={events_on} fills={fills_on}"
+        );
+        assert_eq!(events_off, 0);
+        assert_eq!(events_on, 0);
+        assert_eq!(fills_off, fills_on, "1x 两种口径成交笔数应一致");
+        assert!(
+            (pnl_off - pnl_on).abs() < 1e-9,
+            "1x pnl 应一致: off={pnl_off} on={pnl_on}"
+        );
+        assert!(
+            (nav_off - nav_on).abs() < 1e-9,
+            "1x final_nav 应一致: off={nav_off} on={nav_on}"
+        );
     }
 }

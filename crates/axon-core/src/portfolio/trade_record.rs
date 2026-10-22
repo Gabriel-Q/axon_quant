@@ -34,6 +34,15 @@ pub struct TradeRecord {
     /// T0.17 新增:首次开仓时间(纳秒),取 PositionState.entry_time_ns
     #[serde(default)]
     pub entry_time_ns: i64,
+    /// 构成该持仓的开仓 fill id 列表(同向加仓会追加多条)
+    #[serde(default)]
+    pub entry_fill_ids: Vec<u32>,
+    /// 持仓周期内所有平仓 fill id 列表(FLAT_TO_FLAT 聚合语义)
+    ///
+    /// - 回测路径:Vec 含所有部分平仓 + 最终全平 fill ids
+    /// - 实盘路径:恒为 vec![0]
+    #[serde(default)]
+    pub exit_fill_ids: Vec<u32>,
 }
 
 impl TradeRecord {
@@ -48,6 +57,10 @@ impl TradeRecord {
     /// - `instrument`:成交所属的 Instrument
     /// - `entry_price`:开仓均价(单位 f64 × 1e6,PositionState.avg_cost)
     /// - `entry_time_ns`:首次开仓时间(纳秒,PositionState.entry_time_ns)
+    /// - `entry_fill_ids`:构成该持仓的开仓 fill id 列表(同向加仓会追加多条)
+    /// - `exit_fill_ids`:持仓周期内所有平仓 fill ids(回测 FLAT_TO_FLAT 聚合;实盘恒为 vec![0])
+    // 构造器字段一对一透传,拆成 builder 反而增加调用点噪声
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trade: Trade,
         realized_pnl: i64,
@@ -56,6 +69,8 @@ impl TradeRecord {
         instrument: Instrument,
         entry_price: i64,
         entry_time_ns: i64,
+        entry_fill_ids: Vec<u32>,
+        exit_fill_ids: Vec<u32>,
     ) -> Self {
         Self {
             trade,
@@ -65,6 +80,8 @@ impl TradeRecord {
             instrument,
             entry_price,
             entry_time_ns,
+            entry_fill_ids,
+            exit_fill_ids,
         }
     }
 }
@@ -99,11 +116,37 @@ mod tests {
             btc_usdt(),
             10_000_000,
             1_000,
+            Vec::new(),
+            vec![0],
         );
         assert_eq!(rec.realized_pnl, 1_000_000);
         assert_eq!(rec.commission, 100_000);
         assert_eq!(rec.instrument, btc_usdt());
         assert_eq!(rec.entry_price, 10_000_000);
         assert_eq!(rec.entry_time_ns, 1_000);
+    }
+
+    #[test]
+    fn test_trade_record_fill_association() {
+        let trade = Trade::new(
+            Timestamp::from_nanos(1_000),
+            Price::from_f64(100.0),
+            Quantity::from_f64(1.0),
+            1,
+            2,
+        );
+        let rec = TradeRecord::new(
+            trade,
+            1_000_000,
+            100_000,
+            1_000_000,
+            btc_usdt(),
+            10_000_000,
+            1_000,
+            vec![0, 1],
+            vec![2],
+        );
+        assert_eq!(rec.entry_fill_ids, vec![0, 1]);
+        assert_eq!(rec.exit_fill_ids, vec![2]);
     }
 }

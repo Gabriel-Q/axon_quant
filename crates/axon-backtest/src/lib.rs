@@ -16,6 +16,8 @@
 
 pub mod engine;
 pub mod impact;
+/// 永续合约保证金核算与强平计划
+pub mod margin;
 pub mod matching;
 /// 流式回测引擎
 pub mod streaming;
@@ -28,6 +30,7 @@ pub mod python;
 
 pub use engine::BacktestEngine;
 pub use impact::{ImpactStats, ImpactedEngineConfig, ImpactedMatchingEngine};
+pub use margin::{Bracket, MarginMode, MarginSpec};
 pub use matching::{
     L1MatchingEngine, L2MatchingEngine, MatchFill, MatchingEngine, MatchingError, MatchingStats,
     OrderAmend, OrderBookEntry, OrderLocation, SubmitResult, build_limit_order,

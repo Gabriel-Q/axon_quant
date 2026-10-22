@@ -463,6 +463,7 @@ fn l3_adapter_works_in_backtest_engine_continuous_mode() {
         initial_cash: 100_000.0,
         fee_config: FeeConfig::default(),
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     };
 
     // 事件流:对手 sell + 策略 buy market

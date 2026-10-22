@@ -39,6 +39,7 @@ fn config_with_rate(initial_cash: f64, taker_rate: f64) -> BacktestEngineConfig 
         initial_cash,
         fee_config: FeeConfig { taker_rate },
         force_liquidate: false,
+        margin_specs: std::collections::HashMap::new(),
     }
 }
 
